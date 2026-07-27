@@ -1,38 +1,20 @@
 export const seedData = {
   users: [
-    { id: "user-admin", name: "플랫폼관리자", email: "admin@aivle.com", role: "ADMIN", password: "123", orgId: null },
-    { id: "user-manager-1", name: "김관리자", email: "manager@aivle.com", role: "MANAGER", password: "123", orgId: "org-cs" },
-    { id: "user-manager-2", name: "이관리자", email: "manager2@aivle.com", role: "MANAGER", password: "123", orgId: "org-cs" },
-    { id: "user-manager-pending", name: "박관리자", email: "pending-manager@aivle.com", role: "MANAGER", password: "123", orgId: null }
-  ],
-  organizations: [
-    {
-      id: "org-cs",
-      name: "A대학교 컴퓨터공학과",
-      status: "APPROVED",
-      requestedBy: "user-manager-1",
-      createdAt: "2026-06-01T00:00:00.000Z",
-      decidedAt: "2026-06-03T00:00:00.000Z"
-    },
-    {
-      id: "org-ie",
-      name: "B대학교 산업경영공학과",
-      status: "PENDING",
-      requestedBy: "user-manager-pending",
-      createdAt: "2026-07-20T00:00:00.000Z",
-      decidedAt: null
-    }
+    { id: "user-applicant", name: "응시자", email: "applicant@aivle.com", role: "APPLICANT", password: "123", approvalStatus: "APPROVED" },
+    { id: "user-supervisor", name: "김관리자", email: "supervisor@aivle.com", role: "MANAGER", password: "123", approvalStatus: "APPROVED", organizationIds: ["org-aivle-cs"] },
+    { id: "user-admin", name: "관리자", email: "admin@aivle.com", role: "ADMIN", password: "123", approvalStatus: "APPROVED" },
+    { id: "user-candidate-1", name: "홍길동", email: "applicant1@aivle.com", role: "APPLICANT", password: "123", approvalStatus: "APPROVED" }
   ],
   exams: [
     {
       id: "exam-2026-second-half",
-      orgId: "org-cs",
       title: "2026년 하반기 신입 공채 AI 리터러시 역량 평가",
       category: "정규 평가 (Python / Java / C++)",
       duration: "90분",
       questions: "총 4문제",
       status: "AVAILABLE",
-      date: "2026.07.20 ~ 2026.07.22"
+      date: "2026.07.20 ~ 2026.07.22",
+      organizationId: "org-aivle-cs"
     }
   ],
   notices: [
@@ -40,37 +22,31 @@ export const seedData = {
     { id: "notice-camera", title: "보조 카메라(스마트폰) 거치 각도 및 QR 연결 가이드라인", date: "2026.07.15" }
   ],
   examinees: [
-    { id: "examinee-1", orgId: "org-cs", examId: "exam-2026-second-half", name: "김응시", email: "applicant1@aivle.com", examNumber: "20260001", status: "NORMAL", statusText: "정상 응시 중", currentProb: "문제 2번", invitedAt: "2026-07-19T00:00:00.000Z" },
-    { id: "examinee-2", orgId: "org-cs", examId: "exam-2026-second-half", name: "이수험", email: "applicant2@aivle.com", examNumber: "20260002", status: "WARNING", statusText: "시선 이탈 감지", currentProb: "문제 1번", invitedAt: "2026-07-19T00:00:00.000Z" },
-    { id: "examinee-3", orgId: "org-cs", examId: "exam-2026-second-half", name: "박개발", email: "applicant3@aivle.com", examNumber: "20260003", status: "DANGER", statusText: "이어폰 착용 의심", currentProb: "문제 3번", invitedAt: "2026-07-19T00:00:00.000Z" },
-    { id: "examinee-4", orgId: "org-cs", examId: "exam-2026-second-half", name: "최코딩", email: "applicant4@aivle.com", examNumber: "20260004", status: "NORMAL", statusText: "정상 응시 중", currentProb: "문제 4번 제출완료", invitedAt: "2026-07-19T00:00:00.000Z" }
+    { id: "examinee-1", name: "김응시", organizationId: "org-aivle-cs", examId: "exam-2026-second-half", status: "NORMAL", statusText: "정상 응시 중", currentProb: "문제 2번" },
+    { id: "examinee-2", name: "이수험", organizationId: "org-aivle-cs", examId: "exam-2026-second-half", status: "WARNING", statusText: "시선 이탈 감지", currentProb: "문제 1번" },
+    { id: "examinee-3", name: "박개발", organizationId: "org-data-lab", status: "DANGER", statusText: "이어폰 착용 의심", currentProb: "문제 3번" },
+    { id: "examinee-4", name: "최코딩", organizationId: "org-data-lab", status: "NORMAL", statusText: "정상 응시 중", currentProb: "문제 4번 제출완료" }
+  ],
+  warnings: []
+  ,organizations: [
+    { id: "org-aivle-cs", name: "A대학교 컴퓨터공학과", code: "AIVLE-CS", status: "APPROVED", requestedBy: "user-supervisor", managerIds: ["user-supervisor"], createdAt: "2026-07-20T09:00:00.000Z" },
+    { id: "org-data-lab", name: "B대학교 데이터사이언스센터", code: "B-DATA", status: "PENDING", requestedBy: "user-supervisor", managerIds: [], createdAt: "2026-07-22T09:00:00.000Z" }
+  ],
+  candidates: [
+    { id: "candidate-1", name: "홍길동", email: "applicant1@aivle.com", organizationId: "org-aivle-cs", candidateNumber: "AIVLE-1001", status: "REGISTERED", createdAt: "2026-07-20T09:10:00.000Z" }
+  ],
+  questions: [
+    { id: "question-seed-1", examId: "exam-2026-second-half", prompt: "2 + 2 = ?", options: ["3", "4", "5"], answer: "4", createdAt: "2026-07-20T09:20:00.000Z" },
+    { id: "question-seed-2", examId: "exam-2026-second-half", prompt: "JavaScript에서 불변 배열을 만들 때 사용하는 메서드는?", options: ["map", "push", "splice"], answer: "map", createdAt: "2026-07-20T09:21:00.000Z" }
+  ],
+  assignments: [
+    { id: "assignment-1", examId: "exam-2026-second-half", candidateId: "candidate-1", status: "INVITED" }
   ],
   invitations: [],
-  warnings: [],
-  emailVerifications: [],
-  orgPolicies: [
-    {
-      orgId: "org-cs",
-      problems: [
-        { id: "problem-1", title: "LLM 기반 코드 리팩토링 및 성능 검증", points: 25, languages: "Python3, Java17" }
-      ],
-      cheatRules: [
-        { id: "rule-eye-tracking", label: "웹캠 시선 이탈 3회 이상 감지 시 자동 경고 발송", enabled: true },
-        { id: "rule-earphone", label: "이어폰 및 헤드셋 착용 탐지 시 즉시 부정행위 로그 기록", enabled: true },
-        { id: "rule-tab-switch", label: "브라우저 전체 화면 이탈(Tab Switch) 시 시험 강제 제출", enabled: true }
-      ]
-    }
-  ],
-  systemPolicy: {
-    selfSignupEnabled: true,
-    orgApprovalRequired: true,
-    inviteLinkExpiryHours: 72,
-    dataRetentionDays: 365,
-    updatedAt: "2026-06-01T00:00:00.000Z"
+  systemPolicies: {
+    invitationExpiryHours: 24,
+    aiAnalysisEnabled: true,
+    cheatDetection: { gazeWarningEnabled: true, audioDetectionEnabled: true, tabSwitchSubmitEnabled: true }
   },
-  aiConfig: {
-    model: "GPT-4o (고성능 시멘틱 코드 리뷰)",
-    webcamSensitivity: 75,
-    updatedAt: "2026-06-01T00:00:00.000Z"
-  }
+  emailVerifications: []
 };

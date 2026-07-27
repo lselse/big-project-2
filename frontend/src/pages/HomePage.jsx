@@ -1,34 +1,29 @@
-import React from 'react';
+import React, { lazy, Suspense } from 'react';
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 
-// 🌟 ADMIN 전용 탭 컴포넌트
-import OrgApprovalTab from '../admin/OrgApprovalTab';
-import UserMgmtTab from '../admin/UserMgmtTab';
-import AdminExamsTab from '../admin/AdminExamsTab';
-import AdminResultsTab from '../admin/AdminResultsTab';
-import PolicyMgmtTab from '../admin/PolicyMgmtTab';
-import AiConfigTab from '../admin/AiConfigTab';
-import AdminStatsTab from '../admin/AdminStatsTab';
-
-// 🌟 관리자(MANAGER) 전용 탭 컴포넌트
-import OrgRequestTab from '../manager/OrgRequestTab';
-import ExamineeMgmtTab from '../manager/ExamineeMgmtTab';
-import ManagerExamCreateTab from '../manager/ExamCreateTab';
-import InviteMailTab from '../manager/InviteMailTab';
-import ManagerPolicyTab from '../manager/PolicyMgmtTab';
-import LiveMonitoringTab from '../manager/LiveMonitoringTab';
-import ExamStatusTab from '../manager/ExamStatusTab';
-import CheatLogsTab from '../manager/CheatLogsTab';
-import ResultsTab from '../manager/ResultsTab';
-import TeamTab from '../manager/TeamTab';
+// 🌟 관리자 전용 탭 컴포넌트 임포트
+const AdminGovernanceTab = lazy(() => import('../admin/AdminGovernanceTab'));
+const AdminExamsTab = lazy(() => import('../admin/AdminExamsTab'));
+const PolicyMgmtTab = lazy(() => import('../admin/PolicyMgmtTab'));
+const UserMgmtTab = lazy(() => import('../admin/UserMgmtTab'));
+const CheatMgmtTab = lazy(() => import('../admin/CheatMgmtTab'));
+const AiConfigTab = lazy(() => import('../admin/AiConfigTab'));
+const ManagerWorkspaceTab = lazy(() => import('../manager/ManagerWorkspaceTab'));
+const ManagerExamManagementTab = lazy(() => import('../manager/ManagerExamManagementTab'));
 
 // 🌟 응시자 전용 탭 컴포넌트 임포트
-import HomeTab from '../applicant/HomeTab';
-import ExamTab from '../applicant/ExamTab';
-import CheckTab from '../applicant/CheckTab';
-import PracticeTab from '../applicant/PracticeTab';
-import NoticeTab from '../applicant/NoticeTab';
-import FaqTab from '../applicant/FaqTab';
+const HomeTab = lazy(() => import('../applicant/HomeTab'));
+const ExamTab = lazy(() => import('../applicant/ExamTab'));
+const CheckTab = lazy(() => import('../applicant/CheckTab'));
+const PracticeTab = lazy(() => import('../applicant/PracticeTab'));
+const NoticeTab = lazy(() => import('../applicant/NoticeTab'));
+const FaqTab = lazy(() => import('../applicant/FaqTab'));
+
+// 🌟 감독관 전용 탭 컴포넌트 임포트
+const LiveMonitoringTab = lazy(() => import('../supervisor/LiveMonitoringTab'));
+const CheatLogsTab = lazy(() => import('../supervisor/CheatLogsTab'));
+const ExamStatusTab = lazy(() => import('../supervisor/ExamStatusTab'));
+const SupervisorReportsTab = lazy(() => import('../supervisor/ReportsTab'));
 
 export default function HomePage() {
   const navigate = useNavigate();
@@ -36,20 +31,20 @@ export default function HomePage() {
   const [searchParams] = useSearchParams();
 
   const userRole = location.state?.role || localStorage.getItem('userRole') || 'GUEST';
-  const orgApproved = localStorage.getItem('userOrgId') && localStorage.getItem('userOrgStatus') === 'APPROVED';
 
   const isAdmin = userRole === 'ADMIN';
-  const isManager = userRole === 'MANAGER';
+  const isSupervisor = userRole === 'SUPERVISOR' || userRole === 'MANAGER';
 
   // 🌟 권한별 기본 탭 설정
-  const getDefaultTab = () => {
-    if (isAdmin) return 'ORG_APPROVAL';
-    if (isManager) return orgApproved ? 'EXAMINEE_MGMT' : 'ORG_REQUEST';
-    return 'HOME';
-  };
+  const getDefaultTab = () => 'HOME';
 
   const defaultTab = getDefaultTab();
-  const activeTab = location.pathname === '/' ? defaultTab : (searchParams.get('tab') || defaultTab);
+  const requestedTab = location.pathname === '/' ? defaultTab : (searchParams.get('tab') || defaultTab);
+  const protectedGuestTabs = new Set(['EXAM', 'CHECK', 'PRACTICE']);
+  const activeTab = userRole === 'GUEST' && protectedGuestTabs.has(requestedTab)
+    ? defaultTab
+    : requestedTab === 'RESULT' ? defaultTab : requestedTab === 'EXAM_CREATE' ? 'EXAMS' : requestedTab;
+  const showHome = activeTab === 'HOME';
 
   const handleProtectedAction = (actionRoute) => {
     if (userRole === 'GUEST') {
@@ -63,50 +58,43 @@ export default function HomePage() {
   return (
     <div style={{ backgroundColor: '#f8fafc', minHeight: 'calc(100vh - 64px)', padding: '2.5rem 0' }}>
       <main className="container" style={{ maxWidth: '1200px', margin: '0 auto', padding: '0 2rem' }}>
+        <Suspense fallback={<div className="workspace-loading">화면을 불러오는 중입니다...</div>}>
 
         {/* =========================================================================
-            🛡️ [ADMIN 전용 탭 라우팅 허브]
+            🛡️ [관리자(ADMIN) 전용 탭 라우팅 허브]
             ========================================================================= */}
-        {isAdmin && (
+        {isAdmin && !showHome && (
           <div>
-            {activeTab === 'ORG_APPROVAL' && <OrgApprovalTab />}
-            {activeTab === 'MANAGER_MGMT' && <UserMgmtTab />}
-            {activeTab === 'ADMIN_EXAMS' && <AdminExamsTab />}
-            {activeTab === 'ADMIN_RESULTS' && <AdminResultsTab />}
-            {activeTab === 'SYSTEM_POLICY' && <PolicyMgmtTab />}
+            {activeTab === 'GOVERNANCE' && <AdminGovernanceTab />} 
+            {activeTab === 'EXAMS' && <AdminExamsTab />} 
+            {activeTab === 'POLICY_MGMT' && <PolicyMgmtTab />} 
+            {activeTab === 'USER_MGMT' && <UserMgmtTab />} 
+            {activeTab === 'CHEAT_MGMT' && <CheatMgmtTab />} 
             {activeTab === 'AI_CONFIG' && <AiConfigTab />}
-            {activeTab === 'ADMIN_STATS' && <AdminStatsTab />}
           </div>
         )}
 
         {/* =========================================================================
-            🏢 [관리자(MANAGER) 전용 탭 라우팅 허브]
-            조직이 아직 승인/배정되지 않았다면 조직 신청 화면만 노출한다.
+            👁️ [감독관(SUPERVISOR) 전용 탭 라우팅 허브] 🌟 새로 추가됨
             ========================================================================= */}
-        {isManager && (
+        {isSupervisor && !showHome && (
           <div>
-            {!orgApproved ? (
-              <OrgRequestTab />
-            ) : (
-              <>
-                {activeTab === 'EXAMINEE_MGMT' && <ExamineeMgmtTab />}
-                {activeTab === 'EXAM_CREATE' && <ManagerExamCreateTab />}
-                {activeTab === 'INVITE_MAIL' && <InviteMailTab />}
-                {activeTab === 'POLICY_MGMT' && <ManagerPolicyTab />}
-                {activeTab === 'LIVE_MONITORING' && <LiveMonitoringTab />}
-                {activeTab === 'EXAM_STATUS' && <ExamStatusTab />}
-                {activeTab === 'CHEAT_LOGS' && <CheatLogsTab />}
-                {activeTab === 'RESULTS' && <ResultsTab />}
-                {activeTab === 'TEAM' && <TeamTab />}
-              </>
-            )}
+            {activeTab === 'MANAGER_WORKSPACE' && <ManagerWorkspaceTab />} 
+            {activeTab === 'EXAMS' && <ManagerExamManagementTab />}
+            {activeTab === 'LIVE_MONITORING' && <LiveMonitoringTab />}
+            {activeTab === 'CHEAT_LOGS' && <CheatLogsTab />}
+            {activeTab === 'EXAM_STATUS' && <ExamStatusTab />}
+            {activeTab === 'AI_REPORTS' && <SupervisorReportsTab />}
           </div>
         )}
+        </Suspense>
 
         {/* =========================================================================
             👤 [일반 응시자 / 게스트 전용 탭 라우팅 허브]
             ========================================================================= */}
-        {!isAdmin && !isManager && (
+        {showHome && <HomeTab />}
+
+        {!isAdmin && !isSupervisor && !showHome && (
           <>
             {/* 타이틀 및 비회원 경고 바 (HOME이 아닐 때만 렌더링) */}
             {activeTab !== 'HOME' && (
@@ -120,7 +108,7 @@ export default function HomePage() {
                 </h1>
                 {userRole === 'GUEST' && (
                   <span className="badge-status alert-error" style={{ display: 'inline-block', marginTop: '0.5rem' }}>
-                    ⚠️ 비회원 상태입니다. 상세 기능 이용 시 로그인이 요구됩니다.
+                    비회원에게는 공지사항과 FAQ만 제공됩니다. 시험 기능은 초대받은 응시자만 이용할 수 있습니다.
                   </span>
                 )}
               </div>
