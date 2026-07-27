@@ -79,6 +79,11 @@ export const createStore = async (filePath) => {
       data = { ...data, invitations: migratedInvitations };
       shouldSave = true;
     }
+    const migratedInvitationUses = data.invitations.map(({ usedAt, ...invitation }) => usedAt ? { ...invitation, verifiedAt: invitation.verifiedAt ?? usedAt } : invitation);
+    if (migratedInvitationUses.some((invitation, index) => Object.hasOwn(data.invitations[index], "usedAt") || invitation.verifiedAt !== data.invitations[index].verifiedAt)) {
+      data = { ...data, invitations: migratedInvitationUses };
+      shouldSave = true;
+    }
     if (data.questions.length === 0 && data.exams.some((exam) => exam.id === "exam-2026-second-half")) {
       data = { ...data, questions: clone(seedData.questions) };
       shouldSave = true;
@@ -194,6 +199,13 @@ export const createStore = async (filePath) => {
     addQuestion: async (question) => {
       data.questions.push(question);
       await queuedSave();
+    },
+    updateQuestion: async (id, patch) => {
+      const question = data.questions.find((candidate) => candidate.id === id);
+      if (!question) return undefined;
+      Object.assign(question, patch);
+      await queuedSave();
+      return question;
     },
     addAssignment: async (assignment) => {
       data.assignments.push(assignment);

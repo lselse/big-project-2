@@ -59,6 +59,11 @@ test("serves public data and protects administration endpoints", async (context)
   });
   assert.equal(accountLogin.status, 200);
   assert.equal((await accountLogin.json()).user.role, "ADMIN");
+  const managerLogin = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "supervisor@aivle.com", password: "123", role: "MANAGER" }) });
+  const manager = await managerLogin.json();
+  const assignedSeedExaminees = await fetch(`${baseUrl}/api/supervisor/examinees?examId=exam-2026-second-half`, { headers: { Authorization: `Bearer ${manager.token}` } });
+  assert.equal(assignedSeedExaminees.status, 200);
+  assert.equal((await assignedSeedExaminees.json()).some((item) => item.candidateId === "candidate-1"), true);
 });
 
 test("registers managers for ADMIN approval before login", async (context) => {
@@ -94,7 +99,7 @@ test("requires email verification before manager signup and rate-limits invalid 
   assert.equal(locked.status, 429);
 });
 
-test("governs organization approval, manager scope, and one-time invitations", async (context) => {
+test("governs organization approval, manager scope, and invitations reusable before submission", async (context) => {
   const { baseUrl, directory, server } = await startServer();
   context.after(() => server.close());
   const login = async (email, role, password = "123") => {
@@ -144,6 +149,18 @@ test("governs organization approval, manager scope, and one-time invitations", a
   assert.equal(questionResponse.status, 201);
   const assignment = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/assign`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ candidateIds: [candidate.id] }) });
   assert.equal(assignment.status, 201);
+  const assignedBeforeEntry = await fetch(`${baseUrl}/api/supervisor/examinees?examId=${exam.id}`, { headers: { Authorization: `Bearer ${manager.token}` } });
+  assert.equal(assignedBeforeEntry.status, 200);
+  assert.equal((await assignedBeforeEntry.json()).some((item) => item.candidateId === candidate.id && item.status === "NOT_STARTED"), true);
+  const secondExamResponse = await fetch(`${baseUrl}/api/manager/exams`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: organization.id, title: "분리 대상자 평가", duration: "60분", questions: "총 1문제", date: "2026.08.02 10:00" }) });
+  assert.equal(secondExamResponse.status, 201);
+  const secondExam = await secondExamResponse.json();
+  const firstExamCandidates = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/candidates`, { headers: { Authorization: `Bearer ${manager.token}` } });
+  assert.equal(firstExamCandidates.status, 200);
+  assert.deepEqual((await firstExamCandidates.json()).map((item) => item.id), [candidate.id]);
+  const secondExamCandidates = await fetch(`${baseUrl}/api/manager/exams/${secondExam.id}/candidates`, { headers: { Authorization: `Bearer ${manager.token}` } });
+  assert.equal(secondExamCandidates.status, 200);
+  assert.deepEqual(await secondExamCandidates.json(), []);
   const removableCandidateResponse = await fetch(`${baseUrl}/api/manager/candidates`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: organization.id, name: "Remove Before Invite", email: "remove-before-invite@example.com" }) });
   const removableCandidate = await removableCandidateResponse.json();
   const removableAssignment = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/assign`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ candidateIds: [removableCandidate.id] }) });
@@ -156,6 +173,7 @@ test("governs organization approval, manager scope, and one-time invitations", a
   assert.equal(invitation.count, 1);
   assert.equal(invitation.deliveryStatus, "PREVIEW");
   assert.equal(invitation.mailPreviews[0].oneTimeToken, undefined);
+  assert.equal(Date.parse(invitation.mailPreviews[0].expiresAt), new Date(2026, 7, 1, 11, 0).getTime());
   const entryUrl = new URL(invitation.mailPreviews[0].entryLink);
   assert.equal(entryUrl.pathname, "/exam/enter");
   const token = entryUrl.searchParams.get("token");
@@ -169,6 +187,10 @@ test("governs organization approval, manager scope, and one-time invitations", a
   const verified = await fetch(`${baseUrl}/api/invitations/${token}/verify`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateNumber: candidate.candidateNumber }) });
   assert.equal(verified.status, 200);
   const applicantToken = (await verified.json()).accessToken;
+  const revisit = await fetch(`${baseUrl}/api/invitations/${token}`);
+  assert.equal(revisit.status, 200);
+  const reverified = await fetch(`${baseUrl}/api/invitations/${token}/verify`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateNumber: candidate.candidateNumber }) });
+  assert.equal(reverified.status, 200);
   const applicantSession = await fetch(`${baseUrl}/api/applicant/session`, { headers: { Authorization: `Bearer ${applicantToken}` } });
   assert.equal(applicantSession.status, 200);
   const applicantExam = await fetch(`${baseUrl}/api/applicant/exam`, { headers: { Authorization: `Bearer ${applicantToken}` } });
@@ -186,6 +208,34 @@ test("governs organization approval, manager scope, and one-time invitations", a
   const scopedExaminees = await fetch(`${baseUrl}/api/supervisor/examinees`, { headers: { Authorization: `Bearer ${manager.token}` } });
   assert.equal(scopedExaminees.status, 200);
   assert.equal((await scopedExaminees.json()).some((examinee) => examinee.candidateId === candidate.id), true);
+  const codingQuestionResponse = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions`, {
+    method: "POST",
+    headers: managerHeaders,
+    body: JSON.stringify({
+      type: "CODING", title: "두 수의 합", languages: ["Python", "JavaScript"],
+      description: "두 정수 A와 B를 입력받아 합을 출력하세요.", inputFormat: "첫째 줄에 정수 A와 B가 공백으로 주어집니다.", outputFormat: "A와 B의 합을 출력합니다.", constraints: "1 ≤ A, B ≤ 100",
+      publicExamples: [{ input: "3 5", expectedOutput: "8", explanation: "두 수를 더합니다." }],
+      hiddenTestCases: [{ input: "1 2", expectedOutput: "3" }], judgeMode: "IGNORE_WHITESPACE", referenceSolutions: { Python: "a, b = map(int, input().split())\nprint(a + b)" }
+    })
+  });
+  assert.equal(codingQuestionResponse.status, 201);
+  const codingQuestion = await codingQuestionResponse.json();
+  assert.equal(codingQuestion.hiddenTestCases.length, 1);
+  assert.equal(codingQuestion.difficulty, undefined);
+  assert.equal(codingQuestion.timeLimitSeconds, undefined);
+  assert.equal(codingQuestion.memoryLimitMb, undefined);
+  const codingQuestionUpdate = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions/${codingQuestion.id}`, {
+    method: "PATCH",
+    headers: managerHeaders,
+    body: JSON.stringify({ ...codingQuestion, type: "CODING", title: "두 수의 합 (수정)", hiddenTestCases: [{ input: "10 20", expectedOutput: "30" }] })
+  });
+  assert.equal(codingQuestionUpdate.status, 200);
+  assert.equal((await codingQuestionUpdate.json()).title, "두 수의 합 (수정)");
+  const codingApplicantExam = await fetch(`${baseUrl}/api/applicant/exam`, { headers: { Authorization: `Bearer ${applicantToken}` } });
+  const codingApplicantQuestion = (await codingApplicantExam.json()).questions.find((item) => item.id === codingQuestion.id);
+  assert.equal(codingApplicantQuestion.hiddenTestCases, undefined);
+  assert.equal(codingApplicantQuestion.referenceSolutions, undefined);
+  assert.equal(codingApplicantQuestion.publicExamples[0].expectedOutput, "8");
 });
 
 test("allows ADMIN to view the full exam directory without exam creation access", async (context) => {
@@ -247,7 +297,9 @@ test("allows organization-code join approval and scopes monitoring by exam", asy
   assert.ok(exams.some((exam) => exam.id === "exam-2026-second-half"));
   const examinees = await fetch(baseUrl + "/api/supervisor/examinees?examId=exam-2026-second-half", { headers: { Authorization: "Bearer " + supervisor.token } });
   assert.equal(examinees.status, 200);
-  assert.equal((await examinees.json()).length, 2);
+  const scopedExaminees = await examinees.json();
+  assert.equal(scopedExaminees.length, 1);
+  assert.equal(scopedExaminees[0].candidateId, "candidate-1");
 });
 
 test("removes plaintext passwords from an existing database", async () => {

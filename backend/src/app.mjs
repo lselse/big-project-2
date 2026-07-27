@@ -10,6 +10,14 @@ const isManagerRole = (role) => role === "MANAGER" || role === "SUPERVISOR";
 const sessionTtlMs = 8 * 60 * 60 * 1000;
 const applicantSessionTtlMs = 4 * 60 * 60 * 1000;
 const hashToken = (token) => createHash("sha256").update(token).digest("hex");
+const scheduledExamEndsAt = (exam) => {
+  const schedule = String(exam.date ?? "").trim().match(/^(\d{4})[.-](\d{1,2})[.-](\d{1,2})\s+(\d{1,2}):(\d{2})$/);
+  const durationMinutes = Number.parseInt(String(exam.duration ?? "").match(/\d+/)?.[0] ?? "", 10);
+  if (!schedule || !Number.isFinite(durationMinutes) || durationMinutes <= 0) return undefined;
+  const [, year, month, day, hour, minute] = schedule;
+  const startsAt = new Date(Number(year), Number(month) - 1, Number(day), Number(hour), Number(minute));
+  return Number.isNaN(startsAt.getTime()) ? undefined : new Date(startsAt.getTime() + durationMinutes * 60 * 1000).toISOString();
+};
 const managerOrganizationIds = (user, organizations) => organizations
   .filter((organization) => user.approvalStatus === "APPROVED" && organization.status === "APPROVED" && (organization.managerIds?.includes(user.id) || user.organizationIds?.includes(organization.id)))
   .map((organization) => organization.id);
@@ -26,6 +34,19 @@ const loginLockoutMs = 15 * 60 * 1000;
 const loginFailureLimit = 5;
 const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
 const invitationForToken = (invitations, token) => invitations.find((invitation) => invitation.tokenHash === hashToken(token));
+const codingLanguages = new Set(["Python", "Java", "JavaScript"]);
+const judgeModes = new Set(["EXACT", "IGNORE_WHITESPACE", "NUMERIC_TOLERANCE", "CUSTOM"]);
+const normalizeTestCases = (testCases, requireAtLeastOne = false) => {
+  if (!Array.isArray(testCases)) return undefined;
+  const normalized = testCases.map((testCase) => ({
+    input: typeof testCase?.input === "string" ? testCase.input.trim() : "",
+    expectedOutput: typeof testCase?.expectedOutput === "string" ? testCase.expectedOutput.trim() : "",
+    explanation: typeof testCase?.explanation === "string" ? testCase.explanation.trim() : ""
+  }));
+  if ((requireAtLeastOne && normalized.length === 0) || normalized.some((testCase) => !testCase.input || !testCase.expectedOutput)) return undefined;
+  return normalized;
+};
+const publicQuestion = ({ answer, hiddenTestCases, referenceSolutions, customJudgeCode, ...question }) => question;
 
 const requestUser = (sessions, users, removeSession) => (request, response, next) => {
   const token = request.header("authorization")?.replace("Bearer ", "");
@@ -206,7 +227,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
   });
   app.get("/api/applicant/exam", authenticateApplicant, (request, response) => {
     const { exam } = request.applicantSession;
-    const questions = store.questions.filter((question) => question.examId === exam.id).map(({ answer, ...question }) => question);
+    const questions = store.questions.filter((question) => question.examId === exam.id).map(publicQuestion);
     return response.json({ exam: { id: exam.id, title: exam.title, duration: exam.duration, questions: exam.questions, date: exam.date }, questions });
   });
   app.post("/api/applicant/exam/submit", authenticateApplicant, async (request, response, next) => {
@@ -216,6 +237,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       const questions = store.questions.filter((question) => question.examId === exam.id);
       if (questions.length === 0) return response.status(409).json({ message: "시험 문제가 아직 등록되지 않았습니다." });
       if (invitation.submittedAt) return response.status(409).json({ message: "이 시험은 이미 제출되었습니다." });
+      if (questions.some((question) => question.type === "CODING")) return response.status(503).json({ message: "코딩 문제 채점 서버가 아직 연결되지 않았습니다. 답안은 저장하거나 제출 처리되지 않았습니다." });
       const correctCount = questions.filter((question) => answers[question.id] === question.answer).length;
       const score = Math.round((correctCount / questions.length) * 100);
       const assignment = store.assignments.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
@@ -460,9 +482,33 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
     if (!scopedExam(request, request.params.id)) return response.status(403).json({ message: "배정된 승인 조직의 시험만 조회할 수 있습니다." });
     return response.json(store.questions.filter((question) => question.examId === request.params.id));
   });
+  app.get("/api/manager/exams/:id/candidates", authenticate, requireManager, (request, response) => {
+    const exam = scopedExam(request, request.params.id);
+    if (!exam) return response.status(403).json({ message: "배정된 승인 조직의 시험만 조회할 수 있습니다." });
+    const assignedCandidateIds = new Set(store.assignments.filter((assignment) => assignment.examId === exam.id).map((assignment) => assignment.candidateId));
+    return response.json(store.candidates.filter((candidate) => assignedCandidateIds.has(candidate.id)));
+  });
   app.post("/api/manager/exams/:id/questions", authenticate, requireManager, async (request, response, next) => {
     try {
       if (!scopedExam(request, request.params.id)) return response.status(403).json({ message: "배정된 승인 조직의 시험만 관리할 수 있습니다." });
+      if (request.body.type === "CODING") {
+        const { title, languages, description, inputFormat, outputFormat, constraints, publicExamples, hiddenTestCases, judgeMode, numericTolerance, customJudgeCode, referenceSolutions } = request.body;
+        const normalizedLanguages = Array.isArray(languages) ? [...new Set(languages.filter((language) => codingLanguages.has(language)))] : [];
+        const normalizedPublicExamples = normalizeTestCases(publicExamples, true);
+        const normalizedHiddenTestCases = normalizeTestCases(hiddenTestCases, true);
+        const normalizedReferenceSolutions = Object.fromEntries(Object.entries(referenceSolutions && typeof referenceSolutions === "object" ? referenceSolutions : {}).filter(([language, source]) => codingLanguages.has(language) && isNonEmptyText(source)).map(([language, source]) => [language, source.trim()]));
+        if (![title, description, inputFormat, outputFormat, constraints].every(isNonEmptyText) || !normalizedLanguages.length || !normalizedPublicExamples || !normalizedHiddenTestCases || !judgeModes.has(judgeMode)) return response.status(400).json({ message: "코딩 문제 정보, 입출력 형식, 공개 예제, 숨김 테스트를 모두 입력해주세요." });
+        if (judgeMode === "NUMERIC_TOLERANCE" && (!Number.isFinite(numericTolerance) || numericTolerance < 0)) return response.status(400).json({ message: "숫자 오차 허용 범위를 입력해주세요." });
+        if (judgeMode === "CUSTOM" && !isNonEmptyText(customJudgeCode)) return response.status(400).json({ message: "별도 채점 코드를 입력해주세요." });
+        const question = {
+          id: randomUUID(), examId: request.params.id, type: "CODING", title: title.trim(), prompt: description.trim(), description: description.trim(),
+          languages: normalizedLanguages, inputFormat: inputFormat.trim(), outputFormat: outputFormat.trim(), constraints: constraints.trim(),
+          publicExamples: normalizedPublicExamples, hiddenTestCases: normalizedHiddenTestCases, judgeMode, numericTolerance: judgeMode === "NUMERIC_TOLERANCE" ? numericTolerance : undefined,
+          customJudgeCode: judgeMode === "CUSTOM" ? customJudgeCode.trim() : undefined, referenceSolutions: normalizedReferenceSolutions, createdAt: new Date().toISOString()
+        };
+        await store.addQuestion(question);
+        return response.status(201).json(question);
+      }
       const { prompt, options, answer } = request.body;
       if (!isNonEmptyText(prompt) || !Array.isArray(options) || options.length < 2 || !isNonEmptyText(answer)) return response.status(400).json({ message: "문제, 선택지, 정답을 입력해주세요." });
       const normalizedOptions = [...new Set(options.map((option) => String(option).trim()).filter(Boolean))];
@@ -472,6 +518,31 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       const question = { id: randomUUID(), examId: request.params.id, prompt: prompt.trim(), options: normalizedOptions, answer: normalizedAnswer, createdAt: new Date().toISOString() };
       await store.addQuestion(question);
       return response.status(201).json(question);
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.patch("/api/manager/exams/:examId/questions/:questionId", authenticate, requireManager, async (request, response, next) => {
+    try {
+      if (!scopedExam(request, request.params.examId)) return response.status(403).json({ message: "배정된 승인 조직의 시험만 관리할 수 있습니다." });
+      const current = store.questions.find((question) => question.id === request.params.questionId && question.examId === request.params.examId);
+      if (!current) return response.status(404).json({ message: "문제를 찾을 수 없습니다." });
+      if (current.type !== "CODING" || request.body.type !== "CODING") return response.status(400).json({ message: "코딩 문제만 이 화면에서 수정할 수 있습니다." });
+      const { title, languages, description, inputFormat, outputFormat, constraints, publicExamples, hiddenTestCases, judgeMode, numericTolerance, customJudgeCode, referenceSolutions } = request.body;
+      const normalizedLanguages = Array.isArray(languages) ? [...new Set(languages.filter((language) => codingLanguages.has(language)))] : [];
+      const normalizedPublicExamples = normalizeTestCases(publicExamples, true);
+      const normalizedHiddenTestCases = normalizeTestCases(hiddenTestCases, true);
+      const normalizedReferenceSolutions = Object.fromEntries(Object.entries(referenceSolutions && typeof referenceSolutions === "object" ? referenceSolutions : {}).filter(([language, source]) => codingLanguages.has(language) && isNonEmptyText(source)).map(([language, source]) => [language, source.trim()]));
+      if (![title, description, inputFormat, outputFormat, constraints].every(isNonEmptyText) || !normalizedLanguages.length || !normalizedPublicExamples || !normalizedHiddenTestCases || !judgeModes.has(judgeMode)) return response.status(400).json({ message: "코딩 문제 정보, 입출력 형식, 공개 예제, 숨김 테스트를 모두 입력해주세요." });
+      if (judgeMode === "NUMERIC_TOLERANCE" && (!Number.isFinite(numericTolerance) || numericTolerance < 0)) return response.status(400).json({ message: "숫자 오차 허용 범위를 입력해주세요." });
+      if (judgeMode === "CUSTOM" && !isNonEmptyText(customJudgeCode)) return response.status(400).json({ message: "별도 채점 코드를 입력해주세요." });
+      const question = await store.updateQuestion(current.id, {
+        title: title.trim(), prompt: description.trim(), description: description.trim(), languages: normalizedLanguages,
+        inputFormat: inputFormat.trim(), outputFormat: outputFormat.trim(), constraints: constraints.trim(), publicExamples: normalizedPublicExamples, hiddenTestCases: normalizedHiddenTestCases,
+        judgeMode, numericTolerance: judgeMode === "NUMERIC_TOLERANCE" ? numericTolerance : undefined, customJudgeCode: judgeMode === "CUSTOM" ? customJudgeCode.trim() : undefined,
+        referenceSolutions: normalizedReferenceSolutions, updatedAt: new Date().toISOString()
+      });
+      return response.json(question);
     } catch (error) {
       return next(error);
     }
@@ -492,6 +563,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
         if (!store.assignments.some((assignment) => assignment.examId === exam.id && assignment.candidateId === candidate.id)) {
           const assignment = { id: randomUUID(), examId: exam.id, candidateId: candidate.id, status: "ASSIGNED" };
           await store.addAssignment(assignment);
+          await store.addExaminee({ id: randomUUID(), candidateId: candidate.id, name: candidate.name, organizationId: candidate.organizationId, examId: exam.id, status: "NOT_STARTED", statusText: "미접속", currentProb: "시험 시작 전" });
           created.push(assignment);
         }
       }
@@ -509,7 +581,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       if (candidates.length !== candidateIds.length) return response.status(403).json({ message: "같은 조직의 응시자만 배정 해제할 수 있습니다." });
       const submittedCandidateIds = new Set([
         ...store.assignments.filter((assignment) => assignment.examId === exam.id && candidateIds.includes(assignment.candidateId) && assignment.status === "SUBMITTED").map((assignment) => assignment.candidateId),
-        ...store.invitations.filter((invitation) => invitation.examId === exam.id && candidateIds.includes(invitation.candidateId) && invitation.usedAt).map((invitation) => invitation.candidateId)
+        ...store.invitations.filter((invitation) => invitation.examId === exam.id && candidateIds.includes(invitation.candidateId) && invitation.submittedAt).map((invitation) => invitation.candidateId)
       ]);
       if (submittedCandidateIds.size > 0) return response.status(409).json({ message: "제출이 완료된 응시자의 배정은 삭제할 수 없습니다." });
       const assignedCandidateIds = new Set(store.assignments
@@ -528,14 +600,14 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       if (!exam || candidateIds.length === 0) return response.status(400).json({ message: "시험과 초대할 응시자를 확인해주세요." });
       const eligibleCandidateIds = candidateIds.filter((candidateId) => store.assignments.some((assignment) => assignment.examId === exam.id && assignment.candidateId === candidateId));
       if (eligibleCandidateIds.length !== candidateIds.length) return response.status(409).json({ message: "시험 대상자로 먼저 배정한 응시자만 초대할 수 있습니다." });
-      const expiresAt = new Date(Date.now() + (Number(request.body.expiresInHours) || store.systemPolicies.invitationExpiryHours) * 60 * 60 * 1000).toISOString();
+      const expiresAt = scheduledExamEndsAt(exam) ?? new Date(Date.now() + (Number(request.body.expiresInHours) || store.systemPolicies.invitationExpiryHours) * 60 * 60 * 1000).toISOString();
       const previews = [];
       const createdInvitationIds = [];
       for (const candidate of store.candidates.filter((item) => eligibleCandidateIds.includes(item.id) && item.organizationId === exam.organizationId)) {
-        const activeInvitations = store.invitations.filter((item) => item.examId === exam.id && item.candidateId === candidate.id && !item.usedAt && !item.revokedAt);
+        const activeInvitations = store.invitations.filter((item) => item.examId === exam.id && item.candidateId === candidate.id && !item.submittedAt && !item.revokedAt);
         await Promise.all(activeInvitations.map((item) => store.updateInvitation(item.id, { revokedAt: new Date().toISOString() })));
         const token = randomUUID();
-      const invitation = { id: randomUUID(), tokenHash: hashToken(token), examId: exam.id, organizationId: exam.organizationId, candidateId: candidate.id, candidateNumber: candidate.candidateNumber, expiresAt, sentAt: new Date().toISOString(), usedAt: null, revokedAt: null };
+      const invitation = { id: randomUUID(), tokenHash: hashToken(token), examId: exam.id, organizationId: exam.organizationId, candidateId: candidate.id, candidateNumber: candidate.candidateNumber, expiresAt, sentAt: new Date().toISOString(), verifiedAt: null, submittedAt: null, revokedAt: null };
         await store.addInvitation(invitation);
         createdInvitationIds.push(invitation.id);
         previews.push({ to: candidate.email, examName: exam.title, schedule: exam.date, entryLink: new URL("/exam/enter?token=" + encodeURIComponent(token), publicWebOrigin).toString(), candidateNumber: candidate.candidateNumber, notice: "시험 시작 전 웹캠, 마이크, 화면 공유를 점검해주세요.", expiresAt, oneTimeToken: token });
@@ -562,6 +634,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
   });
   app.get("/api/invitations/:token", (request, response) => {
     const invitation = invitationForToken(store.invitations, request.params.token);
+    if (invitation?.submittedAt) return response.status(410).json({ message: "제출이 완료된 시험의 초대 링크입니다." });
     if (!invitation || invitation.usedAt || invitation.revokedAt || new Date(invitation.expiresAt) < new Date()) return response.status(410).json({ message: "만료되었거나 이미 사용된 초대 링크입니다." });
     const exam = store.exams.find((candidate) => candidate.id === invitation.examId);
     const organization = store.organizations.find((candidate) => candidate.id === invitation.organizationId);
@@ -570,6 +643,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
   app.post("/api/invitations/:token/verify", async (request, response, next) => {
     try {
       const invitation = invitationForToken(store.invitations, request.params.token);
+      if (invitation?.submittedAt) return response.status(410).json({ message: "제출이 완료된 시험의 초대 링크입니다." });
       if (!invitation || invitation.usedAt || invitation.revokedAt || new Date(invitation.expiresAt) < new Date()) return response.status(410).json({ message: "만료되었거나 이미 사용된 초대 링크입니다." });
       const failureKey = `${request.ip}:${invitation.id}`;
       const failure = candidateFailures.get(failureKey);
@@ -586,9 +660,8 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       else await store.addExaminee({ id: randomUUID(), candidateId: invitation.candidateId, name: store.candidates.find((candidate) => candidate.id === invitation.candidateId)?.name ?? "응시자", organizationId: invitation.organizationId, examId: invitation.examId, status: "NORMAL", statusText: "시험 입장 완료", currentProb: "시험 시작 전" });
       const accessToken = randomUUID();
       const session = { tokenHash: hashToken(accessToken), role: "APPLICANT", invitationId: invitation.id, expiresAt: new Date(Date.now() + applicantSessionTtlMs).toISOString() };
-      const usedAt = new Date().toISOString();
       sessions.set(session.tokenHash, session);
-      await store.updateInvitation(invitation.id, { usedAt });
+      await store.updateInvitation(invitation.id, { verifiedAt: invitation.verifiedAt ?? new Date().toISOString() });
       await store.addSession(session);
       return response.json({ accessToken, examId: invitation.examId, candidateNumber: invitation.candidateNumber });
     } catch (error) {
@@ -602,7 +675,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
     return response.json(store.exams.filter((exam) => organizationIds.includes(exam.organizationId) && (!requestedOrganizationId || exam.organizationId === requestedOrganizationId)).map((exam) => ({
       ...exam,
       organizationName: store.organizations.find((organization) => organization.id === exam.organizationId)?.name ?? "조직",
-      examineeCount: store.examinees.filter((examinee) => examinee.examId === exam.id).length
+      examineeCount: store.assignments.filter((assignment) => assignment.examId === exam.id).length
     })));
   });
   app.get("/api/supervisor/examinees", authenticate, requireManager, (request, response) => {
@@ -614,7 +687,15 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       const exam = store.exams.find((candidate) => candidate.id === examId);
       if (!exam || !organizationIds.includes(exam.organizationId) || (requestedOrganizationId && exam.organizationId !== requestedOrganizationId)) return response.status(403).json({ message: "배정된 승인 조직의 시험만 관제할 수 있습니다." });
     }
-    return response.json(store.examinees.filter((examinee) => examinee.organizationId && organizationIds.includes(examinee.organizationId) && (!requestedOrganizationId || examinee.organizationId === requestedOrganizationId) && (!examId || examinee.examId === examId)));
+    const assignedCandidates = store.assignments
+      .filter((assignment) => !examId || assignment.examId === examId)
+      .map((assignment) => ({ assignment, candidate: store.candidates.find((candidate) => candidate.id === assignment.candidateId) }))
+      .filter(({ candidate }) => candidate && organizationIds.includes(candidate.organizationId) && (!requestedOrganizationId || candidate.organizationId === requestedOrganizationId))
+      .map(({ assignment, candidate }) => {
+        const examinee = store.examinees.find((item) => item.examId === assignment.examId && item.candidateId === candidate.id);
+        return examinee ?? { id: `assignment-${assignment.examId}-${candidate.id}`, candidateId: candidate.id, name: candidate.name, organizationId: candidate.organizationId, examId: assignment.examId, status: "NOT_STARTED", statusText: "미접속", currentProb: "시험 시작 전" };
+      });
+    return response.json(assignedCandidates);
   });
   app.post("/api/supervisor/examinees/:id/warnings", authenticate, requireManager, async (request, response, next) => {
     try {
