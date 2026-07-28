@@ -644,7 +644,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
         }
         deliveryStatus = "SENT";
       }
-      const safePreviews = previews.map(({ oneTimeToken, entryLink, ...preview }) => ({ ...preview, entryLink: process.env.NODE_ENV === "production" ? publicWebOrigin + "/invite/[메일 전송 전용 토큰]" : entryLink }));
+      const safePreviews = previews.map(({ oneTimeToken, entryLink, ...preview }) => ({ ...preview, entryLink: deliveryStatus === "SENT" ? publicWebOrigin + "/invite/[메일 전송 전용 토큰]" : entryLink }));
       return response.status(201).json({ count: safePreviews.length, deliveryStatus, mailPreviews: safePreviews });
     } catch (error) {
       return next(error);
