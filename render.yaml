@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: aivle-backend
+    runtime: node
+    plan: free
+    region: singapore
+    rootDir: backend
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.2
+      - key: ALLOWED_ORIGINS
+        fromService:
+          type: web
+          name: aivle-frontend
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: PUBLIC_WEB_ORIGIN
+        fromService:
+          type: web
+          name: aivle-frontend
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: INVITATION_EMAIL_WEBHOOK_URL
+        sync: false
+      - key: EMAIL_VERIFICATION_WEBHOOK_URL
+        sync: false
+
+  - type: web
+    name: aivle-frontend
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: NODE_VERSION
+        value: 22.22.2
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: aivle-backend
+          envVarKey: RENDER_EXTERNAL_URL
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
