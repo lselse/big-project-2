@@ -1,484 +1,118 @@
-import assert from "node:assert/strict";
-import { mkdtemp, readFile, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import test from "node:test";
-import { createApp } from "../src/app.mjs";
-import { createStore } from "../src/store.mjs";
+import React, { useCallback, useEffect, useState } from 'react';
+import { CheckCircle2, Cpu, KeyRound, LoaderCircle, Play, Save, ShieldCheck } from 'lucide-react';
+import { api, apiErrorMessage, authHeaders } from '../api/client';
 
-const startServer = async (options = {}) => {
-  const directory = await mkdtemp(join(tmpdir(), "aivle-api-"));
-  const app = await createApp({ ...options, databasePath: join(directory, "database.json") });
-  const server = app.listen(0);
-  await new Promise((resolveReady) => server.once("listening", resolveReady));
-  const address = server.address();
-  return { baseUrl: `http://127.0.0.1:${address.port}`, directory, server };
+const providerModels = {
+  OpenAI: ['gpt-5.6', 'gpt-5.5', 'gpt-5.4', 'o3', 'o3-mini', 'gpt-4o', 'gpt-4o-mini', 'gpt-live', 'gpt-realtime'],
+  Anthropic: ['claude-opus-5', 'claude-sonnet-5', 'claude-fable-5', 'claude-opus-4.8', 'claude-sonnet-4.6', 'claude-haiku-4.5'],
+  'Google Gemini': ['gemini-3.5-flash', 'gemini-3.1-pro', 'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-3.1-flash-lite'],
+  DeepSeek: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-v3.2', 'deepseek-r1'],
+  Cohere: ['command-a-plus', 'command-a', 'north-mini-code', 'rerank-4-pro', 'embed-4'],
+  'Mistral AI': ['mistral-large-3', 'mistral-small-4', 'codestral', 'pixtral'],
+  'Meta (Together AI, Groq 등)': ['llama-3.3', 'llama-3.2']
 };
 
-const signupManager = async (baseUrl, email, name = "신규 조직 관리자") => {
-  const send = await fetch(`${baseUrl}/api/auth/email-verification/send`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email }) });
-  const sendPayload = await send.json();
-  const confirm = await fetch(`${baseUrl}/api/auth/email-verification/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, verificationId: sendPayload.verificationId, code: sendPayload.previewCode }) });
-  const confirmPayload = await confirm.json();
-  return fetch(`${baseUrl}/api/auth/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, email, password: "safe-password", verificationToken: confirmPayload.verificationToken }) });
-};
+const statusLabel = { PENDING: '대기 중', PROCESSING: '채점 실행 중', COMPLETED: '완료', FAILED: '실패' };
+const formatDate = (value) => value ? new Intl.DateTimeFormat('ko-KR', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)) : '-';
 
-test("serves public data and protects administration endpoints", async (context) => {
-  const { baseUrl, directory, server } = await startServer();
-  context.after(() => server.close());
+export default function AiConfigTab() {
+  const [settings, setSettings] = useState({ provider: 'OpenAI', model: 'gpt-4o-mini', apiKeyConfigured: false, organizations: [] });
+  const [requests, setRequests] = useState([]);
+  const [apiKey, setApiKey] = useState('');
+  const [message, setMessage] = useState('');
+  const [keyCheck, setKeyCheck] = useState(null);
+  const [checkingKey, setCheckingKey] = useState(false);
+  const [acceptingId, setAcceptingId] = useState('');
 
-  const exams = await fetch(`${baseUrl}/api/exams`);
-  assert.equal(exams.status, 403);
-  assert.match((await exams.json()).message, /초대 메일/);
+  const loadRequests = useCallback(async () => {
+    const { data } = await api.get('/admin/ai-grading-requests', { headers: authHeaders() });
+    setRequests(data);
+  }, []);
 
-  const denied = await fetch(`${baseUrl}/api/admin/users`);
-  assert.equal(denied.status, 401);
+  useEffect(() => {
+    Promise.all([
+      api.get('/admin/ai-settings', { headers: authHeaders() }),
+      loadRequests()
+    ]).then(([{ data }]) => setSettings(data))
+      .catch((error) => setMessage(apiErrorMessage(error, 'AI 설정을 불러오지 못했습니다.')));
+  }, [loadRequests]);
 
-  const signup = await fetch(`${baseUrl}/api/auth/signup`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: "신규 응시자", email: "new-applicant@aivle.com", password: "safe-password", role: "APPLICANT" })
-  });
-  assert.equal(signup.status, 400);
-  assert.match((await signup.json()).message, /회원가입/);
+  useEffect(() => {
+    if (!requests.some((request) => request.status === 'PROCESSING')) return undefined;
+    const timer = window.setInterval(() => loadRequests().catch(() => {}), 4000);
+    return () => window.clearInterval(timer);
+  }, [loadRequests, requests]);
 
-  const database = JSON.parse(await readFile(join(directory, "database.json"), "utf8"));
-  assert.equal(database.users.some((user) => user.email === "new-applicant@aivle.com"), false);
-
-  const privilegedSignup = await fetch(`${baseUrl}/api/auth/signup`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: "권한 상승 시도", email: "blocked-admin@aivle.com", password: "safe-password", role: "ADMIN" })
-  });
-  assert.equal(privilegedSignup.status, 400);
-
-  const accountLogin = await fetch(`${baseUrl}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: "admin@aivle.com", password: "123" })
-  });
-  assert.equal(accountLogin.status, 200);
-  assert.equal((await accountLogin.json()).user.role, "ADMIN");
-  const managerLogin = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "supervisor@aivle.com", password: "123", role: "MANAGER" }) });
-  const manager = await managerLogin.json();
-  const assignedSeedExaminees = await fetch(`${baseUrl}/api/supervisor/examinees?examId=exam-2026-second-half`, { headers: { Authorization: `Bearer ${manager.token}` } });
-  assert.equal(assignedSeedExaminees.status, 200);
-  assert.equal((await assignedSeedExaminees.json()).some((item) => item.candidateId === "candidate-1"), true);
-});
-
-test("registers managers for ADMIN approval before login", async (context) => {
-  const { baseUrl, server } = await startServer();
-  context.after(() => server.close());
-  const signup = await signupManager(baseUrl, "new-manager@example.com");
-  assert.equal(signup.status, 201);
-  const pendingLogin = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "new-manager@example.com", password: "safe-password" }) });
-  assert.equal(pendingLogin.status, 403);
-  const adminLogin = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "admin@aivle.com", password: "123" }) });
-  const admin = await adminLogin.json();
-  const users = await fetch(`${baseUrl}/api/admin/users`, { headers: { Authorization: `Bearer ${admin.token}` } });
-  const manager = (await users.json()).find((user) => user.email === "new-manager@example.com");
-  const approval = await fetch(`${baseUrl}/api/admin/users/${manager.id}/status`, { method: "PATCH", headers: { "Content-Type": "application/json", Authorization: `Bearer ${admin.token}` }, body: JSON.stringify({ status: "APPROVED" }) });
-  assert.equal(approval.status, 200);
-  const approvedLogin = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "new-manager@example.com", password: "safe-password" }) });
-  assert.equal(approvedLogin.status, 200);
-});
-
-test("requires email verification before manager signup and rate-limits invalid codes", async (context) => {
-  const { baseUrl, server } = await startServer();
-  context.after(() => server.close());
-  const unverified = await fetch(`${baseUrl}/api/auth/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "미인증 관리자", email: "unverified@example.com", password: "safe-password" }) });
-  assert.equal(unverified.status, 400);
-  const send = await fetch(`${baseUrl}/api/auth/email-verification/send`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "verified@example.com" }) });
-  const payload = await send.json();
-  assert.equal(send.status, 201);
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    const invalid = await fetch(`${baseUrl}/api/auth/email-verification/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "verified@example.com", verificationId: payload.verificationId, code: "000000" }) });
-    assert.equal(invalid.status, 401);
-  }
-  const locked = await fetch(`${baseUrl}/api/auth/email-verification/confirm`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "verified@example.com", verificationId: payload.verificationId, code: payload.previewCode }) });
-  assert.equal(locked.status, 429);
-});
-
-test("governs organization approval, manager scope, and invitations reusable before submission", async (context) => {
-  const { baseUrl, directory, server } = await startServer();
-  context.after(() => server.close());
-  const login = async (email, role, password = "123") => {
-    const response = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password, role }) });
-    return response.json();
+  const updateProvider = (provider) => {
+    setSettings((current) => ({ ...current, provider, model: providerModels[provider][0] }));
+    setKeyCheck(null);
   };
-  const admin = await login("admin@aivle.com", "ADMIN");
-  const adminHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${admin.token}` };
-  const managerCreation = await fetch(`${baseUrl}/api/admin/managers`, { method: "POST", headers: adminHeaders, body: JSON.stringify({ name: "신관리자", email: "manager2@aivle.com", password: "safe-password" }) });
-  assert.equal(managerCreation.status, 201);
-  const managersAfterCreation = await fetch(`${baseUrl}/api/admin/users`, { headers: { Authorization: `Bearer ${admin.token}` } });
-  const managerPayload = (await managersAfterCreation.json()).find((user) => user.email === "manager2@aivle.com");
-  const manager = await login("manager2@aivle.com", "MANAGER", "safe-password");
-  const managerHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${manager.token}` };
-  const requestOrganization = await fetch(`${baseUrl}/api/manager/organizations`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ name: "C대학교 AI학과", code: "C-AI" }) });
-  const organization = await requestOrganization.json();
-  assert.equal(organization.status, "PENDING");
-  const approve = await fetch(`${baseUrl}/api/admin/organizations/${organization.id}/approve`, { method: "POST", headers: adminHeaders });
-  assert.equal(approve.status, 200);
-  const afterApprovalExam = await fetch(`${baseUrl}/api/manager/exams`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: organization.id, title: "승인 후 평가", duration: "60분", questions: "총 1문제" }) });
-  assert.equal(afterApprovalExam.status, 201);
-  const organizations = await fetch(`${baseUrl}/api/admin/organizations`, { headers: { Authorization: `Bearer ${admin.token}` } });
-  const managedOrganization = (await organizations.json()).find((candidate) => candidate.id === organization.id);
-  assert.equal(managedOrganization.managers.length, 1);
-  const outOfScopeCandidate = await fetch(`${baseUrl}/api/manager/candidates`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: "org-aivle-cs", name: "범위 밖 응시자", email: "outside@example.com", birthDate: "2000-01-01" }) });
-  assert.equal(outOfScopeCandidate.status, 403);
-  const candidateResponse = await fetch(`${baseUrl}/api/manager/candidates`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: organization.id, name: "초대 응시자", email: "invitee@example.com", birthDate: "2000-01-01" }) });
-  const candidate = await candidateResponse.json();
-  assert.match(candidate.candidateNumber, /^AIVLE-/);
-  const examResponse = await fetch(`${baseUrl}/api/manager/exams`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: organization.id, title: "C 조직 평가", duration: "60분", questions: "총 5문제", date: "2026.08.01 10:00" }) });
-  assert.equal(examResponse.status, 201);
-  const exam = await examResponse.json();
-  const supervisor = await login("supervisor@aivle.com", "MANAGER");
-  const crossOrganizationResults = await fetch(`${baseUrl}/api/manager/results?examId=${exam.id}`, { headers: { Authorization: `Bearer ${supervisor.token}` } });
-  assert.equal(crossOrganizationResults.status, 403);
-  const crossOrganizationExams = await fetch(`${baseUrl}/api/supervisor/exams?organizationId=${organization.id}`, { headers: { Authorization: `Bearer ${supervisor.token}` } });
-  assert.equal(crossOrganizationExams.status, 403);
-  const crossOrganizationExaminees = await fetch(`${baseUrl}/api/supervisor/examinees?organizationId=${organization.id}`, { headers: { Authorization: `Bearer ${supervisor.token}` } });
-  assert.equal(crossOrganizationExaminees.status, 403);
-  const crossOrganizationWarnings = await fetch(`${baseUrl}/api/supervisor/warnings?organizationId=${organization.id}`, { headers: { Authorization: `Bearer ${supervisor.token}` } });
-  assert.equal(crossOrganizationWarnings.status, 403);
-  const managerExams = await fetch(`${baseUrl}/api/manager/exams`, { headers: { Authorization: `Bearer ${manager.token}` } });
-  assert.ok((await managerExams.json()).some((candidate) => candidate.id === exam.id));
-  const invalidQuestion = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ prompt: "invalid", options: ["A", "B"], answer: "C" }) });
-  assert.equal(invalidQuestion.status, 400);
-  const questionResponse = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ prompt: "2 + 2 = ?", options: ["3", "4"], answer: "4" }) });
-  assert.equal(questionResponse.status, 201);
-  const assignment = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/assign`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ candidateIds: [candidate.id] }) });
-  assert.equal(assignment.status, 201);
-  const assignedBeforeEntry = await fetch(`${baseUrl}/api/supervisor/examinees?examId=${exam.id}`, { headers: { Authorization: `Bearer ${manager.token}` } });
-  assert.equal(assignedBeforeEntry.status, 200);
-  assert.equal((await assignedBeforeEntry.json()).some((item) => item.candidateId === candidate.id && item.status === "NOT_STARTED"), true);
-  const secondExamResponse = await fetch(`${baseUrl}/api/manager/exams`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: organization.id, title: "분리 대상자 평가", duration: "60분", questions: "총 1문제", date: "2026.08.02 10:00" }) });
-  assert.equal(secondExamResponse.status, 201);
-  const secondExam = await secondExamResponse.json();
-  const firstExamCandidates = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/candidates`, { headers: { Authorization: `Bearer ${manager.token}` } });
-  assert.equal(firstExamCandidates.status, 200);
-  assert.deepEqual((await firstExamCandidates.json()).map((item) => item.id), [candidate.id]);
-  const secondExamCandidates = await fetch(`${baseUrl}/api/manager/exams/${secondExam.id}/candidates`, { headers: { Authorization: `Bearer ${manager.token}` } });
-  assert.equal(secondExamCandidates.status, 200);
-  assert.deepEqual(await secondExamCandidates.json(), []);
-  const removableCandidateResponse = await fetch(`${baseUrl}/api/manager/candidates`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: organization.id, name: "Remove Before Invite", email: "remove-before-invite@example.com", birthDate: "2000-01-01" }) });
-  const removableCandidate = await removableCandidateResponse.json();
-  const removableAssignment = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/assign`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ candidateIds: [removableCandidate.id] }) });
-  assert.equal(removableAssignment.status, 201);
-  const removeAssignment = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/assignments`, { method: "DELETE", headers: managerHeaders, body: JSON.stringify({ candidateIds: [removableCandidate.id] }) });
-  assert.equal(removeAssignment.status, 200);
-  assert.equal((await removeAssignment.json()).removedCount, 1);
-  const invitationResponse = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/invitations/send`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ candidateIds: [candidate.id] }) });
-  const invitation = await invitationResponse.json();
-  assert.equal(invitation.count, 1);
-  assert.equal(invitation.deliveryStatus, "PREVIEW");
-  assert.equal(invitation.mailPreviews[0].oneTimeToken, undefined);
-  assert.equal(Date.parse(invitation.mailPreviews[0].expiresAt), new Date(2026, 7, 1, 11, 0).getTime());
-  const entryUrl = new URL(invitation.mailPreviews[0].entryLink);
-  assert.equal(entryUrl.origin, "http://localhost:5173");
-  assert.equal(entryUrl.pathname, "/exam/enter");
-  const token = entryUrl.searchParams.get("token");
-  assert.ok(token);
-  const invitationInfo = await fetch(`${baseUrl}/api/invitations/${token}`);
-  assert.equal(invitationInfo.status, 200);
-  assert.equal((await invitationInfo.json()).duration, "60분");
 
-  const pastExamResponse = await fetch(`${baseUrl}/api/manager/exams`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ organizationId: organization.id, title: "과거 일정 시험", duration: "60분", questions: "총 1문제", date: "2000.01.01 10:00" }) });
-  assert.equal(pastExamResponse.status, 201);
-  const pastExam = await pastExamResponse.json();
-  const pastAssignment = await fetch(`${baseUrl}/api/manager/exams/${pastExam.id}/assign`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ candidateIds: [candidate.id] }) });
-  assert.equal(pastAssignment.status, 201);
-  const pastInvitationResponse = await fetch(`${baseUrl}/api/manager/exams/${pastExam.id}/invitations/send`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ candidateIds: [candidate.id] }) });
-  const pastInvitation = await pastInvitationResponse.json();
-  assert.equal(pastInvitationResponse.status, 201);
-  assert.ok(Date.parse(pastInvitation.mailPreviews[0].expiresAt) > Date.now());
-  const pastToken = new URL(pastInvitation.mailPreviews[0].entryLink).searchParams.get("token");
-  const pastInvitationInfo = await fetch(`${baseUrl}/api/invitations/${pastToken}`);
-  assert.equal(pastInvitationInfo.status, 200);
-
-  const savedDatabase = JSON.parse(await readFile(join(directory, "database.json"), "utf8"));
-  assert.equal(savedDatabase.invitations[0].token, undefined);
-  assert.ok(savedDatabase.invitations[0].tokenHash);
-  const verified = await fetch(`${baseUrl}/api/invitations/${token}/verify`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateNumber: candidate.candidateNumber }) });
-  assert.equal(verified.status, 200);
-  const applicantToken = (await verified.json()).accessToken;
-  const revisit = await fetch(`${baseUrl}/api/invitations/${token}`);
-  assert.equal(revisit.status, 200);
-  const reverified = await fetch(`${baseUrl}/api/invitations/${token}/verify`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateNumber: candidate.candidateNumber }) });
-  assert.equal(reverified.status, 200);
-  const applicantSession = await fetch(`${baseUrl}/api/applicant/session`, { headers: { Authorization: `Bearer ${applicantToken}` } });
-  assert.equal(applicantSession.status, 200);
-  const applicantExam = await fetch(`${baseUrl}/api/applicant/exam`, { headers: { Authorization: `Bearer ${applicantToken}` } });
-  const applicantExamPayload = await applicantExam.json();
-  assert.equal(applicantExam.status, 200);
-  assert.equal(applicantExamPayload.questions[0].answer, undefined);
-  const submission = await fetch(`${baseUrl}/api/applicant/exam/submit`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${applicantToken}` }, body: JSON.stringify({ answers: { [applicantExamPayload.questions[0].id]: "4" } }) });
-  assert.equal(submission.status, 200);
-  const duplicateSubmission = await fetch(`${baseUrl}/api/applicant/exam/submit`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${applicantToken}` }, body: JSON.stringify({ answers: {} }) });
-  assert.equal(duplicateSubmission.status, 409);
-  const protectedRemoval = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/assignments`, { method: "DELETE", headers: managerHeaders, body: JSON.stringify({ candidateIds: [candidate.id] }) });
-  assert.equal(protectedRemoval.status, 409);
-  const reused = await fetch(`${baseUrl}/api/invitations/${token}/verify`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ candidateNumber: candidate.candidateNumber }) });
-  assert.equal(reused.status, 410);
-  const scopedExaminees = await fetch(`${baseUrl}/api/supervisor/examinees`, { headers: { Authorization: `Bearer ${manager.token}` } });
-  assert.equal(scopedExaminees.status, 200);
-  assert.equal((await scopedExaminees.json()).some((examinee) => examinee.candidateId === candidate.id), true);
-  const codingQuestionResponse = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions`, {
-    method: "POST",
-    headers: managerHeaders,
-    body: JSON.stringify({
-      type: "CODING", title: "두 수의 합", languages: ["Python", "JavaScript"],
-      description: "두 정수 A와 B를 입력받아 합을 출력하세요.", inputFormat: "첫째 줄에 정수 A와 B가 공백으로 주어집니다.", outputFormat: "A와 B의 합을 출력합니다.", constraints: "1 ≤ A, B ≤ 100",
-      publicExamples: [{ input: "3 5", expectedOutput: "8", explanation: "두 수를 더합니다." }],
-      hiddenTestCases: [{ input: "1 2", expectedOutput: "3" }], judgeMode: "IGNORE_WHITESPACE", referenceSolutions: { Python: "a, b = map(int, input().split())\nprint(a + b)" }
-    })
-  });
-  assert.equal(codingQuestionResponse.status, 201);
-  const codingQuestion = await codingQuestionResponse.json();
-  assert.equal(codingQuestion.hiddenTestCases.length, 1);
-  assert.equal(codingQuestion.difficulty, undefined);
-  assert.equal(codingQuestion.timeLimitSeconds, undefined);
-  assert.equal(codingQuestion.memoryLimitMb, undefined);
-  const codingQuestionUpdate = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions/${codingQuestion.id}`, {
-    method: "PATCH",
-    headers: managerHeaders,
-    body: JSON.stringify({ ...codingQuestion, type: "CODING", title: "두 수의 합 (수정)", hiddenTestCases: [{ input: "10 20", expectedOutput: "30" }] })
-  });
-  assert.equal(codingQuestionUpdate.status, 200);
-  assert.equal((await codingQuestionUpdate.json()).title, "두 수의 합 (수정)");
-  const codingApplicantExam = await fetch(`${baseUrl}/api/applicant/exam`, { headers: { Authorization: `Bearer ${applicantToken}` } });
-  const codingApplicantQuestion = (await codingApplicantExam.json()).questions.find((item) => item.id === codingQuestion.id);
-  assert.equal(codingApplicantQuestion.hiddenTestCases, undefined);
-  assert.equal(codingApplicantQuestion.referenceSolutions, undefined);
-  assert.equal(codingApplicantQuestion.publicExamples[0].expectedOutput, "8");
-});
-
-test("allows ADMIN to view the full exam directory without exam creation access", async (context) => {
-  const { baseUrl, server } = await startServer();
-  context.after(() => server.close());
-
-  const login = await fetch(`${baseUrl}/api/auth/login`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email: "admin@aivle.com", password: "123", role: "ADMIN" })
-  });
-  assert.equal(login.status, 200);
-  const { token } = await login.json();
-
-  const directory = await fetch(`${baseUrl}/api/admin/exams`, { headers: { Authorization: `Bearer ${token}` } });
-  assert.equal(directory.status, 200);
-  assert.equal((await directory.json()).length, 1);
-
-  const create = await fetch(`${baseUrl}/api/admin/exams`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({ title: "신규 평가", duration: "60분", questions: "총 3문제" })
-  });
-  assert.equal(create.status, 403);
-  assert.match((await create.json()).message, /시험 생성/);
-});
-
-test("allows organization-code join approval and scopes monitoring by exam", async (context) => {
-  const { baseUrl, server } = await startServer();
-  context.after(() => server.close());
-  const login = async (email, role, password = "123") => {
-    const response = await fetch(baseUrl + "/api/auth/login", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password, role }) });
-    return response.json();
+  const verifyKey = async () => {
+    if (!apiKey.trim()) return setKeyCheck({ valid: false, message: '확인할 API 키를 입력하세요.' });
+    setCheckingKey(true);
+    setKeyCheck(null);
+    try {
+      const { data } = await api.post('/admin/ai-settings/verify-key', { provider: settings.provider, apiKey }, { headers: authHeaders() });
+      setKeyCheck(data);
+    } catch (error) {
+      setKeyCheck({ valid: false, message: apiErrorMessage(error, 'API 키 확인에 실패했습니다.') });
+    } finally {
+      setCheckingKey(false);
+    }
   };
-  const admin = await login("admin@aivle.com", "ADMIN");
-  const adminHeaders = { "Content-Type": "application/json", Authorization: "Bearer " + admin.token };
-  const managerAResponse = await fetch(baseUrl + "/api/admin/managers", { method: "POST", headers: adminHeaders, body: JSON.stringify({ name: "조직 관리자 A", email: "join-manager-a@example.com", password: "safe-password" }) });
-  const managerA = (await managerAResponse.json()).user;
-  const managerBResponse = await fetch(baseUrl + "/api/admin/managers", { method: "POST", headers: adminHeaders, body: JSON.stringify({ name: "조직 관리자 B", email: "join-manager-b@example.com", password: "safe-password" }) });
-  const managerB = (await managerBResponse.json()).user;
-  const managerALogin = await login("join-manager-a@example.com", "MANAGER", "safe-password");
-  const createOrganization = await fetch(baseUrl + "/api/manager/organizations", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + managerALogin.token }, body: JSON.stringify({ name: "참여 테스트 조직", code: "JOIN-ORG" }) });
-  const organization = await createOrganization.json();
-  await fetch(baseUrl + "/api/admin/organizations/" + organization.id + "/approve", { method: "POST", headers: adminHeaders });
-  await fetch(baseUrl + "/api/admin/organizations/" + organization.id + "/assign-manager", { method: "POST", headers: adminHeaders, body: JSON.stringify({ managerId: managerA.id }) });
-  const managerBLogin = await login("join-manager-b@example.com", "MANAGER", "safe-password");
-  const managerBHeaders = { "Content-Type": "application/json", Authorization: "Bearer " + managerBLogin.token };
-  const join = await fetch(baseUrl + "/api/manager/organizations/join", { method: "POST", headers: managerBHeaders, body: JSON.stringify({ code: "join-org" }) });
-  assert.equal(join.status, 201);
-  const joinRequest = await join.json();
-  const approveJoin = await fetch(baseUrl + "/api/manager/organization-join-requests/" + joinRequest.id + "/approve", { method: "POST", headers: { Authorization: "Bearer " + managerALogin.token } });
-  assert.equal(approveJoin.status, 200);
-  const managerBOrganizations = await fetch(baseUrl + "/api/manager/organizations", { headers: { Authorization: "Bearer " + managerBLogin.token } });
-  assert.ok((await managerBOrganizations.json()).some((candidate) => candidate.id === organization.id));
-  const supervisor = await login("supervisor@aivle.com", "MANAGER");
-  const managerExams = await fetch(baseUrl + "/api/supervisor/exams", { headers: { Authorization: "Bearer " + supervisor.token } });
-  const exams = await managerExams.json();
-  assert.equal(managerExams.status, 200);
-  assert.ok(exams.some((exam) => exam.id === "exam-2026-second-half"));
-  const examinees = await fetch(baseUrl + "/api/supervisor/examinees?examId=exam-2026-second-half", { headers: { Authorization: "Bearer " + supervisor.token } });
-  assert.equal(examinees.status, 200);
-  const scopedExaminees = await examinees.json();
-  assert.equal(scopedExaminees.length, 1);
-  assert.equal(scopedExaminees[0].candidateId, "candidate-1");
-});
 
-test("removes plaintext passwords from an existing database", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "aivle-api-"));
-  const databasePath = join(directory, "database.json");
-  await writeFile(databasePath, JSON.stringify({
-    users: [{ id: "legacy-user", email: "legacy@aivle.com", password: "legacy-secret", passwordHash: "kept" }],
-    exams: [], notices: [], examinees: [], warnings: []
-  }));
+  const save = async () => {
+    try {
+      const { data } = await api.patch('/admin/ai-settings', {
+        provider: settings.provider,
+        model: settings.model,
+        ...(apiKey ? { apiKey } : {})
+      }, { headers: authHeaders() });
+      setSettings(data);
+      setApiKey('');
+      setKeyCheck(null);
+      setMessage('중앙 AI 연결 설정을 저장했습니다.');
+    } catch (error) {
+      setMessage(apiErrorMessage(error, 'AI 설정 저장에 실패했습니다.'));
+    }
+  };
 
-  await createStore(databasePath);
+  const acceptAndRun = async (requestId) => {
+    setAcceptingId(requestId);
+    try {
+      const { data } = await api.post(`/admin/ai-grading-requests/${requestId}/accept`, {}, { headers: authHeaders() });
+      setRequests((current) => current.map((item) => item.id === requestId ? data : item));
+      setMessage('채점을 중앙 서버에서 실행했습니다. 완료 상태는 자동으로 갱신됩니다.');
+    } catch (error) {
+      setMessage(apiErrorMessage(error, '채점 실행 요청에 실패했습니다.'));
+    } finally {
+      setAcceptingId('');
+    }
+  };
 
-  const migratedDatabase = JSON.parse(await readFile(databasePath, "utf8"));
-  assert.equal(migratedDatabase.users[0].password, undefined);
-  assert.equal(migratedDatabase.users[0].passwordHash, "kept");
-});
+  return <section className="workspace-shell">
+    <div className="workspace-heading"><div><span className="workspace-eyebrow">AI 운영 설정</span><h1>중앙 AI 채점 설정</h1><p>조직의 채점 요청을 관리자가 수락하면 중앙 API 키로 채점하고 결과를 조직에 전달합니다.</p></div><div className="workspace-role-mark admin"><Cpu size={16} /> 전체 운영 설정</div></div>
+    {message && <div className="workspace-alert">{message}</div>}
 
-test("scopes exam policies to the supervising manager's organization", async (context) => {
-  const { baseUrl, server } = await startServer();
-  context.after(() => server.close());
-  const login = async (email, role) => (await (await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password: "123", role }) })).json());
-  const supervisor = await login("supervisor@aivle.com", "MANAGER");
-  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${supervisor.token}` };
-  const initial = await fetch(`${baseUrl}/api/supervisor/exams/exam-2026-second-half/policies`, { headers });
-  assert.equal(initial.status, 200);
-  const policies = await initial.json();
-  const update = await fetch(`${baseUrl}/api/supervisor/exams/exam-2026-second-half/policies`, { method: "PATCH", headers, body: JSON.stringify({ ...policies, invitationExpiryHours: 48, cheatDetection: { ...policies.cheatDetection, tabSwitchSubmitEnabled: false } }) });
-  assert.equal(update.status, 200);
-  assert.equal((await update.json()).invitationExpiryHours, 48);
-  const persisted = await fetch(`${baseUrl}/api/supervisor/exams/exam-2026-second-half/policies`, { headers });
-  assert.equal((await persisted.json()).cheatDetection.tabSwitchSubmitEnabled, false);
-  const outOfScope = await fetch(`${baseUrl}/api/supervisor/exams/not-managed/policies`, { headers });
-  assert.equal(outOfScope.status, 403);
-  const adminPolicies = await fetch(`${baseUrl}/api/admin/policies`, { headers });
-  assert.equal(adminPolicies.status, 403);
-});
+    <div className="data-panel form-panel" style={{ maxWidth: 900 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}><KeyRound size={18} /><h2 style={{ margin: 0, fontSize: '1.05rem' }}>API 설정</h2></div>
+      <div className="form-grid"><label>AI 제공자<select value={settings.provider} onChange={(event) => updateProvider(event.target.value)}>{Object.keys(providerModels).map((provider) => <option key={provider} value={provider}>{provider}</option>)}</select></label><label>모델<select value={settings.model} onChange={(event) => setSettings((current) => ({ ...current, model: event.target.value }))}>{(providerModels[settings.provider] ?? []).map((model) => <option key={model} value={model}>{model}</option>)}</select></label></div>
+      <label style={{ display: 'grid', gap: 6, marginTop: 12 }}>API 키<input type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setKeyCheck(null); }} placeholder={settings.apiKeyConfigured ? '새 키를 입력하면 기존 키를 교체합니다' : 'API 키를 입력하세요'} autoComplete="new-password" /></label>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 10, flexWrap: 'wrap' }}><button className="secondary-button" type="button" onClick={verifyKey} disabled={checkingKey}>{checkingKey ? <LoaderCircle className="spin" size={16} /> : <CheckCircle2 size={16} />} API 키 확인</button>{keyCheck && <span className={keyCheck.valid ? 'form-hint' : 'form-error'}>{keyCheck.message}</span>}</div>
+      <p className="form-hint">검증에 사용한 키는 이 페이지에서만 일시적으로 사용되며, 저장 전에는 서버에 보관되지 않습니다.</p>
+      <div className={`workspace-alert ${settings.apiKeyConfigured ? '' : 'warning'}`} style={{ marginTop: 12 }}><KeyRound size={16} /> {settings.apiKeyConfigured ? '중앙 API 키가 등록되어 있습니다.' : '등록된 중앙 API 키가 없습니다.'}</div>
+      <button className="primary-button" type="button" onClick={save} style={{ marginTop: 12 }}><Save size={16} /> 설정 저장</button>
+    </div>
 
-test("allows only ADMIN to govern invitation policies, inventory, audit logs, and emergency revocation", async (context) => {
-  const { baseUrl, server } = await startServer();
-  context.after(() => server.close());
-  const login = async (email, role) => (await (await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password: "123", role }) })).json());
-  const admin = await login("admin@aivle.com", "ADMIN");
-  const manager = await login("supervisor@aivle.com", "MANAGER");
-  const adminHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${admin.token}` };
-  const managerHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${manager.token}` };
+    <div className="data-panel form-panel" style={{ maxWidth: 900, marginTop: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}><ShieldCheck size={18} /><h2 style={{ margin: 0, fontSize: '1.05rem' }}>조직별 이번 달 사용량</h2></div>
+      <div style={{ overflowX: 'auto' }}><table className="data-table"><thead><tr><th>조직</th><th>이번 달 사용량</th></tr></thead><tbody>{settings.organizations.map((organization) => { const ratio = organization.monthlyLimit > 0 ? Math.min((organization.monthlyUsage / organization.monthlyLimit) * 100, 100) : 0; return <tr key={organization.organizationId}><td>{organization.organizationName}</td><td><div className="ai-quota-meter" role="progressbar" aria-label={`${organization.organizationName} 이번 달 AI 채점 사용량`} aria-valuenow={organization.monthlyUsage} aria-valuemin="0" aria-valuemax={organization.monthlyLimit}><div className="ai-quota-meter-track"><span style={{ width: `${ratio}%` }} /></div><div className="ai-quota-meter-label"><strong>{Math.round(ratio)}% 사용</strong><span>{organization.monthlyUsage}건 · {organization.usageMonth}</span></div></div></td></tr>; })}</tbody></table></div>
+    </div>
 
-  const denied = await fetch(`${baseUrl}/api/admin/invitations/overview`, { headers: managerHeaders });
-  assert.equal(denied.status, 403);
-  const sent = await fetch(`${baseUrl}/api/manager/exams/exam-2026-second-half/invitations/send`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ candidateIds: ["candidate-1"] }) });
-  assert.equal(sent.status, 201);
-
-  const inventory = await fetch(`${baseUrl}/api/admin/invitations`, { headers: adminHeaders });
-  assert.equal(inventory.status, 200);
-  const [invitation] = await inventory.json();
-  assert.equal(invitation.status, "ACTIVE");
-  assert.equal(invitation.token, undefined);
-  assert.equal(invitation.tokenHash, undefined);
-  const overview = await fetch(`${baseUrl}/api/admin/invitations/overview`, { headers: adminHeaders });
-  assert.equal((await overview.json()).metrics.active, 1);
-
-  const policies = await (await fetch(`${baseUrl}/api/admin/policies`, { headers: adminHeaders })).json();
-  const policyUpdate = await fetch(`${baseUrl}/api/admin/policies`, { method: "PATCH", headers: adminHeaders, body: JSON.stringify({ ...policies, invitationExpiryHours: 48, invitationSecurity: { ...policies.invitationSecurity, maxVerificationAttempts: 3, verificationLockoutMinutes: 30 } }) });
-  assert.equal(policyUpdate.status, 200);
-  assert.equal((await policyUpdate.json()).invitationSecurity.maxVerificationAttempts, 3);
-
-  const missingReason = await fetch(`${baseUrl}/api/admin/invitations/${invitation.id}/revoke`, { method: "POST", headers: adminHeaders, body: JSON.stringify({}) });
-  assert.equal(missingReason.status, 400);
-  const revoked = await fetch(`${baseUrl}/api/admin/invitations/${invitation.id}/revoke`, { method: "POST", headers: adminHeaders, body: JSON.stringify({ reason: "링크 유출 의심" }) });
-  assert.equal(revoked.status, 200);
-  assert.equal((await revoked.json()).status, "REVOKED");
-  const audit = await fetch(`${baseUrl}/api/admin/invitation-audit-logs`, { headers: adminHeaders });
-  const actions = (await audit.json()).map((item) => item.action);
-  assert.ok(actions.includes("POLICY_UPDATED"));
-  assert.ok(actions.includes("INVITATION_REVOKED"));
-});
-
-test("allows only ADMIN to manage AI provider settings and organization limits", async (context) => {
-  const { baseUrl, directory, server } = await startServer();
-  context.after(() => server.close());
-  const login = async (email, role) => (await (await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password: "123", role }) })).json());
-  const admin = await login("admin@aivle.com", "ADMIN");
-  const manager = await login("supervisor@aivle.com", "MANAGER");
-  const managerHeaders = { Authorization: `Bearer ${manager.token}` };
-  assert.equal((await fetch(`${baseUrl}/api/admin/ai-settings`, { headers: managerHeaders })).status, 403);
-
-  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${admin.token}` };
-  const initialResponse = await fetch(`${baseUrl}/api/admin/ai-settings`, { headers });
-  assert.equal(initialResponse.status, 200);
-  const initial = await initialResponse.json();
-  assert.equal(typeof initial.apiKeyConfigured, "boolean");
-  assert.equal(Object.hasOwn(initial, "apiKey"), false);
-  assert.equal(initial.organizations.length, 2);
-
-  const invalid = await fetch(`${baseUrl}/api/admin/ai-settings`, { method: "PATCH", headers, body: JSON.stringify({ ...initial, provider: "", organizations: initial.organizations }) });
-  assert.equal(invalid.status, 400);
-  const invalidLimit = await fetch(`${baseUrl}/api/admin/ai-settings`, { method: "PATCH", headers, body: JSON.stringify({ provider: "OpenAI", model: "gpt-4o-mini", organizations: initial.organizations.map((organization) => ({ ...organization, monthlyLimit: -1 })) }) });
-  assert.equal(invalidLimit.status, 400);
-
-  const organization = initial.organizations[0];
-  const update = await fetch(`${baseUrl}/api/admin/ai-settings`, { method: "PATCH", headers, body: JSON.stringify({ provider: "OpenAI", model: "gpt-4.1-mini", organizations: initial.organizations.map((item) => ({ organizationId: item.organizationId, enabled: item.organizationId === organization.organizationId, monthlyLimit: item.organizationId === organization.organizationId ? 120 : 0 })) }) });
-  assert.equal(update.status, 200);
-  const saved = await update.json();
-  assert.equal(saved.model, "gpt-4.1-mini");
-  assert.deepEqual(saved.organizations.find((item) => item.organizationId === organization.organizationId), { ...organization, enabled: true, monthlyLimit: 120 });
-
-  const database = JSON.parse(await readFile(join(directory, "database.json"), "utf8"));
-  assert.equal(database.systemPolicies.aiModel, "gpt-4.1-mini");
-  assert.equal(database.organizationAiPolicies[organization.organizationId].monthlyLimit, 120);
-  assert.equal(JSON.stringify(database).includes("AI_API_KEY"), false);
-});
-
-test("reuses organization AI policy for quota consumption and monthly reset", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "aivle-ai-quota-"));
-  const store = await createStore(join(directory, "database.json"));
-  await store.updateOrganizationAiPolicies({
-    "org-aivle-cs": { enabled: true, monthlyLimit: 1, monthlyUsage: 0, usageMonth: "2026-07" },
-    "org-data-lab": { enabled: false, monthlyLimit: 10, monthlyUsage: 0, usageMonth: "2026-07" }
-  });
-  assert.equal((await store.consumeOrganizationAiQuota("org-data-lab", "2026-07")).reason, "ORGANIZATION_AI_DISABLED");
-  assert.equal((await store.consumeOrganizationAiQuota("org-aivle-cs", "2026-07")).allowed, true);
-  assert.equal((await store.consumeOrganizationAiQuota("org-aivle-cs", "2026-07")).reason, "MONTHLY_AI_LIMIT_EXCEEDED");
-  const nextMonth = await store.consumeOrganizationAiQuota("org-aivle-cs", "2026-08");
-  assert.equal(nextMonth.allowed, true);
-  assert.equal(nextMonth.policy.monthlyUsage, 1);
-  assert.equal(nextMonth.policy.usageMonth, "2026-08");
-});
-
-test("encrypts an API key registered by an ADMIN without returning it", async (context) => {
-  const { baseUrl, directory, server } = await startServer({ aiSettingsEncryptionKey: "test-encryption-key" });
-  context.after(() => server.close());
-  const login = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "admin@aivle.com", password: "123", role: "ADMIN" }) });
-  const admin = await login.json();
-  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${admin.token}` };
-  const initial = await (await fetch(`${baseUrl}/api/admin/ai-settings`, { headers })).json();
-  const response = await fetch(`${baseUrl}/api/admin/ai-settings`, { method: "PATCH", headers, body: JSON.stringify({ provider: initial.provider, model: initial.model, apiKey: "secret-ai-key", organizations: initial.organizations }) });
-  assert.equal(response.status, 200);
-  const payload = await response.json();
-  assert.equal(payload.apiKeyConfigured, true);
-  assert.equal(Object.hasOwn(payload, "apiKey"), false);
-  const database = await readFile(join(directory, "database.json"), "utf8");
-  assert.equal(database.includes("secret-ai-key"), false);
-  assert.equal(database.includes("aiEncryptedApiKey"), true);
-});
-
-test("uses an organization request and central admin acceptance workflow for AI grading", async (context) => {
-  const { baseUrl, server } = await startServer();
-  context.after(() => server.close());
-  const login = async (email, role) => (await (await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email, password: "123", role }) })).json());
-  const manager = await login("supervisor@aivle.com", "MANAGER");
-  const admin = await login("admin@aivle.com", "ADMIN");
-  const managerHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${manager.token}` };
-  const adminHeaders = { Authorization: `Bearer ${admin.token}` };
-
-  const request = await fetch(`${baseUrl}/api/manager/ai-grading-requests`, { method: "POST", headers: managerHeaders, body: JSON.stringify({ examId: "exam-2026-second-half", candidateId: "candidate-1" }) });
-  assert.equal(request.status, 201);
-  const pending = await request.json();
-  assert.equal(pending.status, "PENDING");
-  assert.equal(pending.candidateId, "candidate-1");
-  assert.equal((await fetch(`${baseUrl}/api/admin/ai-grading-requests`, { headers: { Authorization: `Bearer ${manager.token}` } })).status, 403);
-
-  const queue = await fetch(`${baseUrl}/api/admin/ai-grading-requests`, { headers: adminHeaders });
-  assert.equal(queue.status, 200);
-  assert.equal((await queue.json())[0].id, pending.id);
-  const acceptance = await fetch(`${baseUrl}/api/admin/ai-grading-requests/${pending.id}/accept`, { method: "POST", headers: adminHeaders });
-  assert.equal(acceptance.status, 202);
-  assert.equal((await acceptance.json()).status, "PROCESSING");
-});
+    <div className="data-panel form-panel" style={{ maxWidth: 1100, marginTop: 20 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}><Cpu size={18} /><h2 style={{ margin: 0, fontSize: '1.05rem' }}>AI 채점 요청 대기열</h2></div>
+      <div style={{ overflowX: 'auto' }}><table className="data-table"><thead><tr><th>요청 조직</th><th>요청 일시</th><th>대상 응시자 / 시험</th><th>상태</th><th>관리</th></tr></thead><tbody>{requests.length === 0 ? <tr><td colSpan="5">대기 중인 AI 채점 요청이 없습니다.</td></tr> : requests.map((request) => <tr key={request.id}><td>{request.organizationName}</td><td>{formatDate(request.requestedAt)}</td><td><strong>{request.candidateName}</strong><br /><span className="form-hint">{request.examTitle}</span></td><td>{statusLabel[request.status] ?? request.status}{request.status === 'FAILED' && request.errorMessage ? <><br /><span className="form-error">{request.errorMessage}</span></> : null}</td><td>{request.status === 'PENDING' ? <button className="primary-button" type="button" onClick={() => acceptAndRun(request.id)} disabled={acceptingId === request.id}>{acceptingId === request.id ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />} 채점 수락 및 실행</button> : '-'}</td></tr>)}</tbody></table></div>
+    </div>
+  </section>;
+}
