@@ -53,22 +53,9 @@ Vite가 표시하는 주소로 접속합니다. 기본 주소는 `http://localho
 | `VITE_API_BASE_URL` | 프런트엔드 API 기본 주소 |
 | `PUBLIC_WEB_ORIGIN` | 초대 메일에 넣을 프런트엔드 공개 주소 |
 | `ALLOWED_ORIGINS` | 허용할 CORS Origin 목록(쉼표 구분) |
-| `INVITATION_EMAIL_WEBHOOK_URL` | 초대 메일 전달 웹훅 주소 |
-| `EMAIL_VERIFICATION_WEBHOOK_URL` | 관리자 가입 인증 메일 전달 웹훅 주소 |
-
-## Render.com 배포
-
-이 저장소 루트의 `render.yaml`을 사용하면 Render의 Blueprint 기능으로 백엔드(`aivle-backend`, Node 웹 서비스)와 프런트엔드(`aivle-frontend`, 정적 사이트)를 한 번에 배포할 수 있습니다.
-
-1. Render 대시보드에서 **New +** → **Blueprint**를 선택하고 이 저장소를 연결합니다.
-2. `render.yaml`이 자동으로 인식되면 **Apply**를 눌러 두 서비스를 함께 생성합니다.
-3. `ALLOWED_ORIGINS`, `PUBLIC_WEB_ORIGIN`, `VITE_API_BASE_URL`은 두 서비스가 서로의 배포 주소(`RENDER_EXTERNAL_URL`)를 자동으로 참조하므로 별도 설정이 필요 없습니다.
-4. 실제 메일 발송이 필요하면 `aivle-backend` 서비스에 `INVITATION_EMAIL_WEBHOOK_URL`, `EMAIL_VERIFICATION_WEBHOOK_URL`을 채워 넣으세요. 비워두면 기존과 동일하게 `PREVIEW` 모드로 동작합니다.
-
-### 주의 사항
-
-- 무료(Free) 플랜은 재배포·재시작 시 파일시스템이 초기화되므로 `backend/data/database.json`도 함께 초기화됩니다. 데이터를 유지하려면 Render Disk(Starter 플랜 이상)를 `aivle-backend`에 연결하거나, 아래 "운영 전 권장 작업"에 따라 외부 DB로 전환하세요.
-- 무료 플랜은 약 15분 무활동 시 슬립 상태가 되어 이후 첫 요청의 응답이 느릴 수 있습니다.
+| `SENDGRID_API_KEY` | SendGrid API 키. 설정하면 관리자 가입 인증 메일과 시험 초대 메일을 실제 발송합니다. |
+| `SENDGRID_FROM_EMAIL` | SendGrid에서 Single Sender 인증을 마친 발신 이메일 주소 |
+| `SENDGRID_FROM_NAME` | 메일에 표시할 발신자 이름. 예: `Aivle 시험 플랫폼` |
 
 ## 개발 계정
 
@@ -171,3 +158,26 @@ npm run lint
 | 실시간 경고 전달 | 미구현 |
 | 서버 기준 시험 시간 | 미구현 |
 | AI 모델 연동 | 미구현 |
+
+# 메뉴 개선 제안
+
+## ADMIN 메뉴
+
+| 메뉴 | 개선 의견 |
+|------|-----------|
+| **전체 시험 관리** | **전체 시험 조회**로 이 변경하고 **SUPERVISOR** 메뉴로 이동. |
+| **문제/정책 관리** | **시험 정책 관리**로 변경하고 **SUPERVISOR** 메뉴로 이동. |
+| **금지사항 관리** | **시험 금지사항 관리**로 변경하고 **SUPERVISOR** 메뉴로 이동. |
+| **AI 분석 설정** | 메뉴명은 유지. **초대 링크 만료 시간**은 AI 설정과 관련이 없으므로 별도 설정 메뉴로 분리. |
+
+---
+
+## SUPERVISOR 메뉴
+
+| 메뉴 | 개선 의견 |
+|------|-----------|
+| **조직 운영** | 현재 위치 유지. 조직 단위 관리 기능으로 적절함. |
+| **시험 관리** | 현재 위치 유지. 시험 생성 및 운영 기능과 일치함. |
+| **응시자 접속 및 제출 현황** | 현재 위치 유지. 응시자의 접속 및 제출 상태를 확인하는 기능으로 적절함. |
+| **실시간 화상 관제실** | 현재는 응시자 화면 조회 기능에 가까우므로, 실시간 AI 감독 기능을 추가하거나 **화상 모니터링**으로 메뉴명을 변경하는 것이 적절함. |
+| **부정행위 감지 로그** | 현재 위치 유지. 시험 중 발생한 부정행위 기록을 확인하는 기능으로 적절함. |

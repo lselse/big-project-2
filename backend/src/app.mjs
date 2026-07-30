@@ -1,5 +1,5 @@
 import express from "express";
-import { createHash, randomInt, randomUUID } from "node:crypto";
+import { createCipheriv, createHash, randomBytes, randomInt, randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { createStore, verifyPassword } from "./store.mjs";
 
@@ -26,6 +26,13 @@ const publicOrganization = (organization, users) => ({
   managers: (organization.managerIds ?? []).map((id) => users.find((user) => user.id === id)).filter(Boolean).map(publicUser)
 });
 const normalizeEmail = (value) => typeof value === "string" ? value.trim().toLowerCase() : "";
+const aiProviderModels = {
+  OpenAI: new Set(["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]),
+  Anthropic: new Set(["claude-3-5-haiku-latest", "claude-3-7-sonnet-latest"]),
+  "Google Gemini": new Set(["gemini-2.0-flash", "gemini-2.5-flash"])
+};
+const currentUsageMonth = (date = new Date()) => date.toISOString().slice(0, 7);
+const defaultOrganizationAiPolicy = (usageMonth = currentUsageMonth()) => ({ enabled: false, monthlyLimit: 0, monthlyUsage: 0, usageMonth });
 const verificationCodeHash = (code) => createHash("sha256").update(code).digest("hex");
 const verificationTtlMs = 10 * 60 * 1000;
 const verificationCooldownMs = 60 * 1000;
@@ -33,6 +40,24 @@ const maxVerificationAttempts = 5;
 const loginLockoutMs = 15 * 60 * 1000;
 const loginFailureLimit = 5;
 const isValidEmail = (value) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
+const escapeHtml = (value) => String(value).replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]);
+const sendSendGridEmail = async ({ to, subject, html, text }) => {
+  const apiKey = process.env.SENDGRID_API_KEY;
+  const fromEmail = process.env.SENDGRID_FROM_EMAIL;
+  if (!apiKey || !fromEmail) return false;
+  const delivery = await fetch("https://api.sendgrid.com/v3/mail/send", {
+    method: "POST",
+    headers: { Authorization: "Bearer " + apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      personalizations: [{ to: [{ email: to }], subject }],
+      from: { email: fromEmail, ...(process.env.SENDGRID_FROM_NAME ? { name: process.env.SENDGRID_FROM_NAME } : {}) },
+      content: [{ type: "text/plain", value: text }, { type: "text/html", value: html }]
+    }),
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!delivery.ok) throw new Error("SendGrid email delivery failed");
+  return true;
+};
 const isValidBirthDate = (value) => {
   if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
   const [year, month, day] = value.split("-").map(Number);
@@ -53,6 +78,19 @@ const normalizeTestCases = (testCases, requireAtLeastOne = false) => {
   return normalized;
 };
 const publicQuestion = ({ answer, hiddenTestCases, referenceSolutions, customJudgeCode, ...question }) => question;
+const normalizeCodingAnswers = (answers, questions) => Object.fromEntries(questions.filter((question) => question.type === "CODING").map((question) => {
+  const answer = answers[question.id] && typeof answers[question.id] === "object" ? answers[question.id] : {};
+  const languages = question.languages?.length ? question.languages : ["Python"];
+  return [question.id, {
+    language: languages.includes(answer.language) ? answer.language : languages[0],
+    source: typeof answer.source === "string" ? answer.source.slice(0, 100000) : ""
+  }];
+}));
+const normalizeRunResults = (runResults, questions) => Object.fromEntries(questions.filter((question) => question.type === "CODING").flatMap((question) => {
+  const result = runResults?.[question.id];
+  if (!result || typeof result !== "object" || typeof result.output !== "string") return [];
+  return [[question.id, { type: ["success", "error", "notice"].includes(result.type) ? result.type : "notice", output: result.output.slice(0, 20000), executedAt: typeof result.executedAt === "string" ? result.executedAt : new Date().toISOString() }]];
+}));
 
 const requestUser = (sessions, users, removeSession) => (request, response, next) => {
   const token = request.header("authorization")?.replace("Bearer ", "");
@@ -85,14 +123,41 @@ const requireManager = (request, response, next) => {
   return next();
 };
 
-export const createApp = async ({ databasePath = resolve("data/database.json") } = {}) => {
+export const createApp = async ({ databasePath = resolve("data/database.json"), aiSettingsEncryptionKey = process.env.AI_SETTINGS_ENCRYPTION_KEY } = {}) => {
   const store = await createStore(databasePath);
   const sessions = new Map(store.sessions.map((session) => [session.tokenHash, session]));
   const loginFailures = new Map();
   const candidateFailures = new Map();
   const app = express();
   const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS ?? "http://localhost:5173,http://localhost:5174").split(",").map((origin) => origin.trim()).filter(Boolean));
-  const publicWebOrigin = process.env.PUBLIC_WEB_ORIGIN ?? "http://localhost:5174";
+  const publicWebOrigin = process.env.PUBLIC_WEB_ORIGIN || (process.env.RENDER === "true" ? "https://aivle-frontend-gakg.onrender.com" : "http://localhost:5173");
+  const encryptAiApiKey = (apiKey) => {
+    if (!aiSettingsEncryptionKey) return undefined;
+    const initializationVector = randomBytes(12);
+    const cipher = createCipheriv("aes-256-gcm", createHash("sha256").update(aiSettingsEncryptionKey).digest(), initializationVector);
+    const encrypted = Buffer.concat([cipher.update(apiKey, "utf8"), cipher.final()]);
+    return `${initializationVector.toString("base64")}.${cipher.getAuthTag().toString("base64")}.${encrypted.toString("base64")}`;
+  };
+  const organizationAiSettings = () => {
+    const usageMonth = currentUsageMonth();
+    return store.organizations.map((organization) => {
+      const saved = store.organizationAiPolicies[organization.id] ?? defaultOrganizationAiPolicy(usageMonth);
+      return {
+        organizationId: organization.id,
+        organizationName: organization.name,
+        enabled: saved.enabled === true,
+        monthlyLimit: Number.isSafeInteger(saved.monthlyLimit) && saved.monthlyLimit >= 0 ? saved.monthlyLimit : 0,
+        monthlyUsage: saved.usageMonth === usageMonth && Number.isSafeInteger(saved.monthlyUsage) && saved.monthlyUsage >= 0 ? saved.monthlyUsage : 0,
+        usageMonth
+      };
+    });
+  };
+  const publicAiSettings = () => ({
+    provider: store.systemPolicies.aiProvider,
+    model: store.systemPolicies.aiModel,
+    apiKeyConfigured: Boolean(process.env.AI_API_KEY || store.systemPolicies.aiEncryptedApiKey),
+    organizations: organizationAiSettings()
+  });
 
   app.use(express.json({ limit: "1mb" }));
   app.use((request, response, next) => {
@@ -116,16 +181,20 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       if (store.users.some((user) => user.email === email)) return response.status(409).json({ message: "이미 등록된 이메일입니다." });
       const previous = store.emailVerifications.find((item) => item.email === email && !item.verifiedAt);
       if (previous && Date.now() - new Date(previous.sentAt).getTime() < verificationCooldownMs) return response.status(429).json({ message: "인증번호는 1분 후 다시 요청할 수 있습니다." });
-      const webhookUrl = process.env.EMAIL_VERIFICATION_WEBHOOK_URL;
-      if (!webhookUrl && process.env.NODE_ENV === "production") return response.status(503).json({ message: "이메일 인증 서비스가 아직 설정되지 않았습니다." });
       const code = String(randomInt(100000, 1000000));
       const verification = { id: randomUUID(), email, codeHash: verificationCodeHash(code), sentAt: new Date().toISOString(), expiresAt: new Date(Date.now() + verificationTtlMs).toISOString(), attempts: 0, verifiedAt: null, verificationTokenHash: null };
-      let deliveryStatus = "PREVIEW";
-      if (webhookUrl) {
-        const deliveryResponse = await fetch(webhookUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ to: email, subject: "Aivle 관리자 회원가입 이메일 인증번호", code, expiresAt: verification.expiresAt }), signal: AbortSignal.timeout(5000) });
-        if (!deliveryResponse.ok) return response.status(502).json({ message: "인증 메일 전송에 실패했습니다." });
-        deliveryStatus = "SENT";
+      let deliveryStatus;
+      try {
+        deliveryStatus = await sendSendGridEmail({
+          to: email,
+          subject: "[Aivle] 관리자 회원가입 인증번호",
+          html: "<p>관리자 회원가입 인증번호는 <strong>" + code + "</strong>입니다.</p><p>인증번호는 10분 동안 유효합니다.</p>",
+          text: "관리자 회원가입 인증번호는 " + code + "입니다. 인증번호는 10분 동안 유효합니다."
+        }) ? "SENT" : "PREVIEW";
+      } catch {
+        return response.status(502).json({ message: "인증 메일 전송에 실패했습니다." });
       }
+      if (deliveryStatus === "PREVIEW" && (process.env.NODE_ENV === "production" || process.env.SENDGRID_API_KEY || process.env.SENDGRID_FROM_EMAIL)) return response.status(503).json({ message: "SendGrid 이메일 서비스가 아직 설정되지 않았습니다." });
       await store.addEmailVerification(verification);
       return response.status(201).json({ verificationId: verification.id, deliveryStatus, expiresAt: verification.expiresAt, ...(deliveryStatus === "PREVIEW" ? { previewCode: code } : {}) });
     } catch (error) {
@@ -236,6 +305,35 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
     const questions = store.questions.filter((question) => question.examId === exam.id).map(publicQuestion);
     return response.json({ exam: { id: exam.id, title: exam.title, duration: exam.duration, questions: exam.questions, date: exam.date }, questions });
   });
+  app.get("/api/applicant/exam/progress", authenticateApplicant, (request, response) => {
+    const { candidate, exam } = request.applicantSession;
+    const submission = store.codingSubmissions.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
+    return response.json({ answers: submission?.answers ?? {}, runResults: submission?.runResults ?? {}, updatedAt: submission?.updatedAt ?? null, status: submission?.status ?? "DRAFT" });
+  });
+  app.put("/api/applicant/exam/progress", authenticateApplicant, async (request, response, next) => {
+    try {
+      const { invitation, candidate, exam } = request.applicantSession;
+      if (invitation.submittedAt) return response.status(409).json({ message: "이미 제출한 시험의 답안은 수정할 수 없습니다." });
+      const questions = store.questions.filter((question) => question.examId === exam.id);
+      const answers = request.body.answers && typeof request.body.answers === "object" ? request.body.answers : {};
+      const runResults = request.body.runResults && typeof request.body.runResults === "object" ? request.body.runResults : {};
+      const now = new Date().toISOString();
+      const submission = await store.saveCodingSubmission({
+        id: store.codingSubmissions.find((item) => item.examId === exam.id && item.candidateId === candidate.id)?.id ?? randomUUID(),
+        examId: exam.id,
+        organizationId: exam.organizationId,
+        candidateId: candidate.id,
+        answers: normalizeCodingAnswers(answers, questions),
+        runResults: normalizeRunResults(runResults, questions),
+        status: "DRAFT",
+        submittedAt: null,
+        updatedAt: now
+      });
+      return response.json({ updatedAt: submission.updatedAt, status: submission.status });
+    } catch (error) {
+      return next(error);
+    }
+  });
   app.post("/api/applicant/exam/submit", authenticateApplicant, async (request, response, next) => {
     try {
       const { invitation, candidate, exam } = request.applicantSession;
@@ -243,15 +341,31 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       const questions = store.questions.filter((question) => question.examId === exam.id);
       if (questions.length === 0) return response.status(409).json({ message: "시험 문제가 아직 등록되지 않았습니다." });
       if (invitation.submittedAt) return response.status(409).json({ message: "이 시험은 이미 제출되었습니다." });
-      if (questions.some((question) => question.type === "CODING")) return response.status(503).json({ message: "코딩 문제 채점 서버가 아직 연결되지 않았습니다. 답안은 저장하거나 제출 처리되지 않았습니다." });
-      const correctCount = questions.filter((question) => answers[question.id] === question.answer).length;
-      const score = Math.round((correctCount / questions.length) * 100);
+      const codingQuestions = questions.filter((question) => question.type === "CODING");
+      const now = new Date().toISOString();
+      if (codingQuestions.length) {
+        const runResults = request.body.runResults && typeof request.body.runResults === "object" ? request.body.runResults : {};
+        const existingSubmission = store.codingSubmissions.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
+        await store.saveCodingSubmission({
+          id: existingSubmission?.id ?? randomUUID(),
+          examId: exam.id,
+          organizationId: exam.organizationId,
+          candidateId: candidate.id,
+          answers: normalizeCodingAnswers(answers, questions),
+          runResults: normalizeRunResults(runResults, questions),
+          status: "SUBMITTED",
+          submittedAt: now,
+          updatedAt: now
+        });
+      }
+      const correctCount = questions.filter((question) => question.type !== "CODING" && answers[question.id] === question.answer).length;
+      const score = codingQuestions.length ? null : Math.round((correctCount / questions.length) * 100);
       const assignment = store.assignments.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
-      if (assignment) await store.updateAssignment(assignment.id, { status: "SUBMITTED", score, resultStatus: "SUBMITTED", submittedAt: new Date().toISOString() });
-      await store.updateInvitation(invitation.id, { submittedAt: new Date().toISOString() });
+      if (assignment) await store.updateAssignment(assignment.id, { status: "SUBMITTED", score, resultStatus: codingQuestions.length ? "PENDING_REVIEW" : "SUBMITTED", submittedAt: now });
+      await store.updateInvitation(invitation.id, { submittedAt: now });
       const examinee = store.examinees.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
       if (examinee) await store.updateExaminee(examinee.id, { status: "SUBMITTED", statusText: "제출 완료", currentProb: "제출 완료" });
-      return response.json({ examId: exam.id, score, correctCount, totalCount: questions.length, status: "SUBMITTED" });
+      return response.json({ examId: exam.id, score, correctCount, totalCount: questions.length, status: "SUBMITTED", gradingStatus: codingQuestions.length ? "PENDING_REVIEW" : "COMPLETED" });
     } catch (error) {
       return next(error);
     }
@@ -287,6 +401,37 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       const validCheatDetection = cheatDetection === undefined || (cheatDetection && typeof cheatDetection.gazeWarningEnabled === "boolean" && typeof cheatDetection.audioDetectionEnabled === "boolean" && typeof cheatDetection.tabSwitchSubmitEnabled === "boolean");
       if (!Number.isFinite(invitationExpiryHours) || invitationExpiryHours < 1 || invitationExpiryHours > 168 || typeof aiAnalysisEnabled !== "boolean" || !validCheatDetection) return response.status(400).json({ message: "정책 값을 확인해주세요." });
       return response.json(await store.updateSystemPolicies({ invitationExpiryHours, aiAnalysisEnabled, ...(cheatDetection === undefined ? {} : { cheatDetection }) }));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.get("/api/admin/ai-settings", authenticate, requireRole("ADMIN"), (_request, response) => response.json(publicAiSettings()));
+  app.patch("/api/admin/ai-settings", authenticate, requireRole("ADMIN"), async (request, response, next) => {
+    try {
+      const provider = typeof request.body.provider === "string" ? request.body.provider.trim() : "";
+      const model = typeof request.body.model === "string" ? request.body.model.trim() : "";
+      const apiKey = typeof request.body.apiKey === "string" ? request.body.apiKey.trim() : "";
+      const policies = request.body.organizations;
+      const organizationIds = new Set(store.organizations.map((organization) => organization.id));
+      const validPolicies = Array.isArray(policies)
+        && policies.length === organizationIds.size
+        && new Set(policies.map((policy) => policy?.organizationId)).size === organizationIds.size
+        && policies.every((policy) => organizationIds.has(policy?.organizationId) && typeof policy.enabled === "boolean" && Number.isSafeInteger(policy.monthlyLimit) && policy.monthlyLimit >= 0);
+      if (!aiProviderModels[provider]?.has(model) || !validPolicies) return response.status(400).json({ message: "AI 제공자, 모델, 조직별 사용 권한과 월간 한도를 확인해주세요." });
+      if (apiKey && !aiSettingsEncryptionKey) return response.status(503).json({ message: "API 키 암호화 환경변수(AI_SETTINGS_ENCRYPTION_KEY)가 설정되지 않았습니다." });
+      const usageMonth = currentUsageMonth();
+      const nextPolicies = Object.fromEntries(policies.map((policy) => {
+        const current = store.organizationAiPolicies[policy.organizationId];
+        return [policy.organizationId, {
+          enabled: policy.enabled,
+          monthlyLimit: policy.monthlyLimit,
+          monthlyUsage: current?.usageMonth === usageMonth && Number.isSafeInteger(current.monthlyUsage) ? current.monthlyUsage : 0,
+          usageMonth
+        }];
+      }));
+      await store.updateSystemPolicies({ aiProvider: provider, aiModel: model, ...(apiKey ? { aiEncryptedApiKey: encryptAiApiKey(apiKey) } : {}) });
+      await store.updateOrganizationAiPolicies(nextPolicies);
+      return response.json(publicAiSettings());
     } catch (error) {
       return next(error);
     }
@@ -504,6 +649,26 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
     if (!scopedExam(request, request.params.id)) return response.status(403).json({ message: "배정된 승인 조직의 시험만 조회할 수 있습니다." });
     return response.json(store.questions.filter((question) => question.examId === request.params.id));
   });
+  app.get("/api/supervisor/exams/:id/policies", authenticate, requireManager, (request, response) => {
+    const exam = scopedExam(request, request.params.id);
+    if (!exam) return response.status(403).json({ message: "배정된 승인 조직의 시험 정책만 조회할 수 있습니다." });
+    return response.json(exam.examPolicies ?? store.systemPolicies);
+  });
+  app.patch("/api/supervisor/exams/:id/policies", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const exam = scopedExam(request, request.params.id);
+      if (!exam) return response.status(403).json({ message: "배정된 승인 조직의 시험 정책만 수정할 수 있습니다." });
+      const invitationExpiryHours = Number(request.body.invitationExpiryHours);
+      const aiAnalysisEnabled = request.body.aiAnalysisEnabled;
+      const cheatDetection = request.body.cheatDetection;
+      const validCheatDetection = cheatDetection && typeof cheatDetection.gazeWarningEnabled === "boolean" && typeof cheatDetection.audioDetectionEnabled === "boolean" && typeof cheatDetection.tabSwitchSubmitEnabled === "boolean";
+      if (!Number.isFinite(invitationExpiryHours) || invitationExpiryHours < 1 || invitationExpiryHours > 168 || typeof aiAnalysisEnabled !== "boolean" || !validCheatDetection) return response.status(400).json({ message: "정책 값을 확인해주세요." });
+      const updated = await store.updateExam(exam.id, { examPolicies: { invitationExpiryHours, aiAnalysisEnabled, cheatDetection } });
+      return response.json(updated.examPolicies);
+    } catch (error) {
+      return next(error);
+    }
+  });
   app.get("/api/manager/exams/:id/candidates", authenticate, requireManager, (request, response) => {
     const exam = scopedExam(request, request.params.id);
     if (!exam) return response.status(403).json({ message: "배정된 승인 조직의 시험만 조회할 수 있습니다." });
@@ -622,29 +787,34 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       if (!exam || candidateIds.length === 0) return response.status(400).json({ message: "시험과 초대할 응시자를 확인해주세요." });
       const eligibleCandidateIds = candidateIds.filter((candidateId) => store.assignments.some((assignment) => assignment.examId === exam.id && assignment.candidateId === candidateId));
       if (eligibleCandidateIds.length !== candidateIds.length) return response.status(409).json({ message: "시험 대상자로 먼저 배정한 응시자만 초대할 수 있습니다." });
-      const expiresAt = scheduledExamEndsAt(exam) ?? new Date(Date.now() + (Number(request.body.expiresInHours) || store.systemPolicies.invitationExpiryHours) * 60 * 60 * 1000).toISOString();
+      const fallbackExpiresAt = new Date(Date.now() + (Number(request.body.expiresInHours) || store.systemPolicies.invitationExpiryHours) * 60 * 60 * 1000).toISOString();
+      const scheduledExpiresAt = scheduledExamEndsAt(exam);
+      const expiresAt = scheduledExpiresAt && new Date(scheduledExpiresAt) > new Date() ? scheduledExpiresAt : fallbackExpiresAt;
       const previews = [];
       const createdInvitationIds = [];
       for (const candidate of store.candidates.filter((item) => eligibleCandidateIds.includes(item.id) && item.organizationId === exam.organizationId)) {
         const activeInvitations = store.invitations.filter((item) => item.examId === exam.id && item.candidateId === candidate.id && !item.submittedAt && !item.revokedAt);
         await Promise.all(activeInvitations.map((item) => store.updateInvitation(item.id, { revokedAt: new Date().toISOString() })));
         const token = randomUUID();
-      const invitation = { id: randomUUID(), tokenHash: hashToken(token), examId: exam.id, organizationId: exam.organizationId, candidateId: candidate.id, candidateNumber: candidate.candidateNumber, expiresAt, sentAt: new Date().toISOString(), verifiedAt: null, submittedAt: null, revokedAt: null };
+        const invitation = { id: randomUUID(), tokenHash: hashToken(token), examId: exam.id, organizationId: exam.organizationId, candidateId: candidate.id, candidateNumber: candidate.candidateNumber, expiresAt, sentAt: new Date().toISOString(), verifiedAt: null, submittedAt: null, revokedAt: null };
         await store.addInvitation(invitation);
         createdInvitationIds.push(invitation.id);
         previews.push({ to: candidate.email, examName: exam.title, schedule: exam.date, entryLink: new URL("/exam/enter?token=" + encodeURIComponent(token), publicWebOrigin).toString(), candidateNumber: candidate.candidateNumber, notice: "시험 시작 전 웹캠, 마이크, 화면 공유를 점검해주세요.", expiresAt, oneTimeToken: token });
       }
-      const webhookUrl = process.env.INVITATION_EMAIL_WEBHOOK_URL;
-      let deliveryStatus = "PREVIEW";
-      if (webhookUrl) {
-        const deliveryResponse = await fetch(webhookUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ messages: previews }), signal: AbortSignal.timeout(5000) });
-        if (!deliveryResponse.ok) {
-          await Promise.all(createdInvitationIds.map((id) => store.updateInvitation(id, { revokedAt: new Date().toISOString() })));
-          return response.status(502).json({ message: "초대 메일 전송에 실패했습니다." });
-        }
-        deliveryStatus = "SENT";
+      let deliveryStatus;
+      try {
+        const deliveries = await Promise.all(previews.map((preview) => sendSendGridEmail({
+          to: preview.to,
+          subject: "[Aivle] " + preview.examName + " 시험 초대",
+          html: "<p>안녕하세요.</p><p><strong>" + escapeHtml(preview.examName) + "</strong> 시험에 초대되었습니다.</p><ul><li>응시번호: " + escapeHtml(preview.candidateNumber) + "</li><li>시험 일정: " + escapeHtml(preview.schedule) + "</li><li>입장 링크 만료: " + escapeHtml(preview.expiresAt) + "</li></ul><p>" + escapeHtml(preview.notice) + "</p><p><a href=\"" + escapeHtml(preview.entryLink) + "\">시험 입장하기</a></p>",
+          text: preview.examName + " 시험에 초대되었습니다. 응시번호: " + preview.candidateNumber + ". 시험 일정: " + preview.schedule + ". 입장 링크: " + preview.entryLink + ". " + preview.notice
+        })));
+        deliveryStatus = deliveries.every(Boolean) ? "SENT" : "PREVIEW";
+      } catch {
+        await Promise.all(createdInvitationIds.map((id) => store.updateInvitation(id, { revokedAt: new Date().toISOString() })));
+        return response.status(502).json({ message: "초대 메일 전송에 실패했습니다." });
       }
-      const safePreviews = previews.map(({ oneTimeToken, entryLink, ...preview }) => ({ ...preview, entryLink: deliveryStatus === "SENT" ? publicWebOrigin + "/invite/[메일 전송 전용 토큰]" : entryLink }));
+      const safePreviews = previews.map(({ oneTimeToken, ...preview }) => preview);
       return response.status(201).json({ count: safePreviews.length, deliveryStatus, mailPreviews: safePreviews });
     } catch (error) {
       return next(error);
@@ -762,6 +932,40 @@ export const createApp = async ({ databasePath = resolve("data/database.json") }
       return { ...assignment, candidateName: candidate?.name ?? "응시자", candidateEmail: candidate?.email ?? "", examTitle: exam?.title ?? "시험", organizationId: candidate?.organizationId };
     });
     response.json(rows);
+  });
+  app.get("/api/manager/exams/:examId/results/:candidateId", authenticate, requireManager, (request, response) => {
+    const organizationIds = managerOrganizationIds(request.user, store.organizations);
+    const exam = store.exams.find((item) => item.id === request.params.examId && organizationIds.includes(item.organizationId));
+    const candidate = store.candidates.find((item) => item.id === request.params.candidateId && item.organizationId === exam?.organizationId);
+    const assignment = store.assignments.find((item) => item.examId === exam?.id && item.candidateId === candidate?.id);
+    if (!exam || !candidate || !assignment) return response.status(404).json({ message: "조회할 응시자 결과를 찾을 수 없습니다." });
+    const submission = store.codingSubmissions.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
+    const examinee = store.examinees.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
+    const warnings = store.warnings.filter((item) => item.examId === exam.id && item.examineeId === examinee?.id).map((warning) => ({ message: warning.message, createdAt: warning.createdAt }));
+    const questions = store.questions.filter((item) => item.examId === exam.id && item.type === "CODING").map((question) => ({ id: question.id, title: question.title, languages: question.languages ?? [] }));
+    return response.json({
+      candidate: { id: candidate.id, name: candidate.name, email: candidate.email, candidateNumber: candidate.candidateNumber },
+      exam: { id: exam.id, title: exam.title },
+      result: { status: assignment.status, score: assignment.score ?? null, resultStatus: assignment.resultStatus ?? "NOT_SUBMITTED", submittedAt: assignment.submittedAt ?? null, reviewStatus: assignment.reviewStatus ?? "NOT_REVIEWED", reviewNote: assignment.reviewNote ?? "", reviewedAt: assignment.reviewedAt ?? null },
+      codingSubmission: submission ? { answers: submission.answers, runResults: submission.runResults, status: submission.status, submittedAt: submission.submittedAt, updatedAt: submission.updatedAt } : null,
+      questions,
+      warnings
+    });
+  });
+  app.patch("/api/manager/exams/:examId/results/:candidateId/review", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const organizationIds = managerOrganizationIds(request.user, store.organizations);
+      const exam = store.exams.find((item) => item.id === request.params.examId && organizationIds.includes(item.organizationId));
+      const assignment = store.assignments.find((item) => item.examId === exam?.id && item.candidateId === request.params.candidateId);
+      const reviewStatus = typeof request.body.reviewStatus === "string" ? request.body.reviewStatus : "";
+      const reviewNote = typeof request.body.reviewNote === "string" ? request.body.reviewNote.trim().slice(0, 2000) : "";
+      if (!exam || !assignment) return response.status(404).json({ message: "검토할 응시자 결과를 찾을 수 없습니다." });
+      if (!["NOT_REVIEWED", "NORMAL", "REVIEW_REQUIRED", "SUSPICIOUS"].includes(reviewStatus)) return response.status(400).json({ message: "검토 상태가 올바르지 않습니다." });
+      const result = await store.updateAssignment(assignment.id, { reviewStatus, reviewNote, reviewedAt: new Date().toISOString(), reviewedBy: request.user.id });
+      return response.json({ reviewStatus: result.reviewStatus, reviewNote: result.reviewNote, reviewedAt: result.reviewedAt });
+    } catch (error) {
+      return next(error);
+    }
   });
 
   app.use((error, _request, response, _next) => {

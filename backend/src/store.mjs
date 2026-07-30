@@ -13,14 +13,18 @@ const collectionDefaults = {
   candidates: [],
   questions: [],
   assignments: [],
+  codingSubmissions: [],
   invitations: [],
   warnings: [],
   organizationJoinRequests: [],
   sessions: [],
   emailVerifications: [],
+  organizationAiPolicies: {},
   systemPolicies: {
     invitationExpiryHours: 24,
     aiAnalysisEnabled: true,
+    aiProvider: "OpenAI",
+    aiModel: "gpt-4o-mini",
     cheatDetection: {
       gazeWarningEnabled: true,
       audioDetectionEnabled: true,
@@ -28,6 +32,8 @@ const collectionDefaults = {
     }
   }
 };
+
+const defaultExamPolicies = (systemPolicies) => clone({ invitationExpiryHours: systemPolicies.invitationExpiryHours, aiAnalysisEnabled: systemPolicies.aiAnalysisEnabled, cheatDetection: systemPolicies.cheatDetection });
 
 const withDefaults = (value) => ({
   ...value,
@@ -64,6 +70,8 @@ export const createStore = async (filePath) => {
       data = { ...data, systemPolicies: normalizedPolicies };
       shouldSave = true;
     }
+    const examsWithPolicies = data.exams.map((exam) => ({ ...exam, examPolicies: { ...defaultExamPolicies(data.systemPolicies), ...(exam.examPolicies ?? {}), cheatDetection: { ...data.systemPolicies.cheatDetection, ...(exam.examPolicies?.cheatDetection ?? {}) } } }));
+    if (examsWithPolicies.some((exam, index) => JSON.stringify(exam.examPolicies) !== JSON.stringify(data.exams[index].examPolicies))) { data = { ...data, exams: examsWithPolicies }; shouldSave = true; }
     const validSessions = data.sessions.filter((session) => new Date(session.expiresAt) > new Date());
     if (validSessions.length !== data.sessions.length) {
       data = { ...data, sessions: validSessions };
@@ -141,23 +149,46 @@ export const createStore = async (filePath) => {
     get candidates() { return data.candidates; },
     get questions() { return data.questions; },
     get assignments() { return data.assignments; },
+    get codingSubmissions() { return data.codingSubmissions; },
     get invitations() { return data.invitations; },
     get organizationJoinRequests() { return data.organizationJoinRequests; },
     get sessions() { return data.sessions; },
     get emailVerifications() { return data.emailVerifications; },
+    get organizationAiPolicies() { return data.organizationAiPolicies; },
     get systemPolicies() { return data.systemPolicies; },
     updateSystemPolicies: async (patch) => {
       data.systemPolicies = { ...data.systemPolicies, ...patch };
       await queuedSave();
       return data.systemPolicies;
     },
+    updateOrganizationAiPolicies: async (policies) => {
+      data.organizationAiPolicies = clone(policies);
+      await queuedSave();
+      return data.organizationAiPolicies;
+    },
+    consumeOrganizationAiQuota: async (organizationId, usageMonth) => {
+      const policy = data.organizationAiPolicies[organizationId];
+      if (!policy?.enabled) return { allowed: false, reason: "ORGANIZATION_AI_DISABLED" };
+      const monthlyUsage = policy.usageMonth === usageMonth ? policy.monthlyUsage : 0;
+      if (monthlyUsage >= policy.monthlyLimit) return { allowed: false, reason: "MONTHLY_AI_LIMIT_EXCEEDED" };
+      data.organizationAiPolicies[organizationId] = { ...policy, monthlyUsage: monthlyUsage + 1, usageMonth };
+      await queuedSave();
+      return { allowed: true, policy: clone(data.organizationAiPolicies[organizationId]) };
+    },
     addUser: async ({ password, ...user }) => {
       data.users.push({ ...user, passwordHash: await hashPassword(password) });
       await queuedSave();
     },
     addExam: async (exam) => {
-      data.exams.unshift(exam);
+      data.exams.unshift({ ...exam, examPolicies: exam.examPolicies ?? defaultExamPolicies(data.systemPolicies) });
       await queuedSave();
+    },
+    updateExam: async (id, patch) => {
+      const exam = data.exams.find((candidate) => candidate.id === id);
+      if (!exam) return undefined;
+      Object.assign(exam, patch);
+      await queuedSave();
+      return exam;
     },
     addWarning: async (warning) => {
       data.warnings.push(warning);
@@ -227,6 +258,7 @@ export const createStore = async (filePath) => {
         .filter((examinee) => examinee.examId === examId && candidateIdSet.has(examinee.candidateId))
         .map((examinee) => examinee.id));
       data.assignments = data.assignments.filter((assignment) => !assignmentIds.has(assignment.id));
+      data.codingSubmissions = data.codingSubmissions.filter((submission) => !(submission.examId === examId && candidateIdSet.has(submission.candidateId)));
       data.invitations = data.invitations.filter((invitation) => !(invitation.examId === examId && candidateIdSet.has(invitation.candidateId)));
       data.examinees = data.examinees.filter((examinee) => !examineeIds.has(examinee.id));
       data.warnings = data.warnings.filter((warning) => !examineeIds.has(warning.examineeId));
@@ -239,6 +271,13 @@ export const createStore = async (filePath) => {
       Object.assign(assignment, patch);
       await queuedSave();
       return assignment;
+    },
+    saveCodingSubmission: async (submission) => {
+      const existing = data.codingSubmissions.find((candidate) => candidate.examId === submission.examId && candidate.candidateId === submission.candidateId);
+      if (existing) Object.assign(existing, submission);
+      else data.codingSubmissions.push(submission);
+      await queuedSave();
+      return existing ?? submission;
     },
     addInvitation: async (invitation) => {
       data.invitations.unshift(invitation);
