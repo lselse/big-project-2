@@ -57,20 +57,6 @@ Vite가 표시하는 주소로 접속합니다. 기본 주소는 `http://localho
 | `SENDGRID_FROM_EMAIL` | SendGrid에서 Single Sender 인증을 마친 발신 이메일 주소 |
 | `SENDGRID_FROM_NAME` | 메일에 표시할 발신자 이름. 예: `Aivle 시험 플랫폼` |
 
-## Render.com 배포
-
-이 저장소 루트의 `render.yaml`을 사용하면 Render의 Blueprint 기능으로 백엔드(`aivle-backend`, Node 웹 서비스)와 프런트엔드(`aivle-frontend`, 정적 사이트)를 한 번에 배포할 수 있습니다.
-
-1. Render 대시보드에서 **New +** → **Blueprint**를 선택하고 이 저장소를 연결합니다.
-2. `render.yaml`이 자동으로 인식되면 **Apply**를 눌러 두 서비스를 함께 생성합니다.
-3. `ALLOWED_ORIGINS`, `PUBLIC_WEB_ORIGIN`, `VITE_API_BASE_URL`은 두 서비스가 서로의 배포 주소(`RENDER_EXTERNAL_URL`)를 자동으로 참조하므로 별도 설정이 필요 없습니다.
-4. 실제 메일 발송이 필요하면 `aivle-backend` 서비스에 `SENDGRID_API_KEY`, `SENDGRID_FROM_EMAIL`, `SENDGRID_FROM_NAME` 또는 `INVITATION_EMAIL_WEBHOOK_URL`, `EMAIL_VERIFICATION_WEBHOOK_URL`을 채워 넣으세요. 비워두면 기존과 동일하게 `PREVIEW` 모드로 동작합니다.
-
-### 주의 사항
-
-- 무료(Free) 플랜은 재배포·재시작 시 파일시스템이 초기화되므로 `backend/data/database.json`도 함께 초기화됩니다. 데이터를 유지하려면 Render Disk(Starter 플랜 이상)를 `aivle-backend`에 연결하거나 외부 DB로 전환하세요.
-- 무료 플랜은 약 15분 무활동 시 슬립 상태가 되어 이후 첫 요청의 응답이 느릴 수 있습니다.
-
 ## 개발 계정
 
 기본 비밀번호는 모두 `123`입니다.
