@@ -451,7 +451,7 @@ export default function ExamCheckPage() {
                 <div className="identity-camera-box">
                   <video ref={idCaptureModalVideoRef} autoPlay playsInline muted className="video-stream" />
                   {!idWebcamReady && <span className="video-placeholder">웹캠을 불러오는 중...</span>}
-
+                  
                   {/* 촬영 가이드 UI */}
                   {!capturedIdImage && idWebcamReady && (
                     <div className="id-card-guide">
