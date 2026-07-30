@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { AlertTriangle, ArrowRight } from 'lucide-react';
+import { api } from '../api/client';
 
 export default function MobileScanPage() {
   const [searchParams] = useSearchParams();
@@ -43,8 +44,8 @@ export default function MobileScanPage() {
       if (mobileVideoRef.current) {
         mobileVideoRef.current.srcObject = stream;
       }
-      // 카메라 연결 성공 시 서버에 페어링 완료 알림
-      fetch(`/api/device-pairing/${token}/connect`, { method: 'POST' }).catch(() => {});
+      // 카메라 연결 성공 시 서버에 페어링 완료 알림 (프런트엔드가 아니라 실제 백엔드 주소로 전송)
+      api.post(`/device-pairing/${token}/connect`).catch(() => {});
     } catch (err) {
       setErrorMsg('카메라 권한이 거부되었거나 지원하지 않는 브라우저입니다.');
     }
