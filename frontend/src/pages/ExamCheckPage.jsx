@@ -6,13 +6,13 @@ import {
   Camera,
   CheckCircle2,
   CreditCard,
-  Mic,
   Monitor,
   QrCode,
   RefreshCw,
 } from 'lucide-react';
 import { QRCodeCanvas } from 'qrcode.react';
 import { api, apiErrorMessage, candidateAuthHeaders } from '../api/client';
+import { registerLiveStream } from '../applicant/liveMonitoring';
 
 export default function ExamCheckPage() {
   const navigate = useNavigate();
@@ -20,9 +20,6 @@ export default function ExamCheckPage() {
   // 신분증 촬영용 영상
   const idVideoRef = useRef(null);
   const idCaptureModalVideoRef = useRef(null);
-
-  // 웹캠 미리보기용 영상
-  const webcamVideoRef = useRef(null);
 
   // 화면 공유 영상
   const displayRef = useRef(null);
@@ -37,7 +34,6 @@ export default function ExamCheckPage() {
 
   // 촬영 결과
   const [idCardImage, setIdCardImage] = useState('');
-
   // 점검 상태
   const [idCaptureModalOpen, setIdCaptureModalOpen] = useState(false);
   const [idWebcamReady, setIdWebcamReady] = useState(false);
@@ -45,8 +41,6 @@ export default function ExamCheckPage() {
 
 
   const [webcamReady, setWebcamReady] = useState(false);
-  const [camReady, setCamReady] = useState(false);
-  const [micReady, setMicReady] = useState(false);
   const [displayReady, setDisplayReady] = useState(false);
   const [qrConnected, setQrConnected] = useState(false);
 
@@ -69,6 +63,7 @@ export default function ExamCheckPage() {
       if (!event.data) return;
       if (event.data.type === 'QR_CONNECTED' && event.data.token === auxCamToken) {
         setQrConnected(true);
+        syncMediaStatus({ auxiliaryCamera: true });
       }
       if (event.data.type === 'ID_CARD_CAPTURED' && event.data.token === idScanToken) {
         setIdCardImage(event.data.image);
@@ -77,27 +72,25 @@ export default function ExamCheckPage() {
 
     return () => {
       channel.close();
-      webcamStreamRef.current?.getTracks().forEach((track) => track.stop());
       // 모달용 웹캠 스트림 정리
       if (idWebcamStreamRef.current) {
         idWebcamStreamRef.current.getTracks().forEach((track) => track.stop());
       }
-      displayStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, []);
 
-  // 폰이 실제로 QR을 스캔해 연결하면 서버에 물어봐서 자동 감지
   useEffect(() => {
-    if (!auxCamToken || qrConnected) return;
-    const interval = setInterval(() => {
-      api.get(`/device-pairing/${auxCamToken}`)
-        .then(({ data }) => {
-          if (data.connected) setQrConnected(true);
-        })
-        .catch(() => {});
-    }, 2000);
-    return () => clearInterval(interval);
-  }, [auxCamToken, qrConnected]);
+    if (!examSession) return;
+    api.put('/applicant/media-status', {
+      media: {
+        webcam: webcamReady,
+        microphone: webcamReady,
+        screen: displayReady,
+        auxiliaryCamera: qrConnected
+      }
+    }, { headers: candidateAuthHeaders() })
+      .catch((reason) => setErrorMsg(apiErrorMessage(reason, '감독관 화면에 장비 연결 상태를 저장하지 못했습니다.')));
+  }, [displayReady, examSession, qrConnected, webcamReady]);
 
   // 토큰 생성 함수
   const generateNewToken = () => {
@@ -110,6 +103,11 @@ export default function ExamCheckPage() {
     setQrConnected(false);
     setErrorMsg('');
   };
+
+  const syncMediaStatus = (patch) => api.put('/applicant/media-status', {
+    media: { webcam: webcamReady, microphone: webcamReady, screen: displayReady, ...patch }
+  }, { headers: candidateAuthHeaders() })
+    .catch((reason) => setErrorMsg(apiErrorMessage(reason, '감독관 화면에 장비 연결 상태를 저장하지 못했습니다.')));
 
   /**
    * 웹캠과 마이크 연결
@@ -128,24 +126,18 @@ export default function ExamCheckPage() {
       });
 
       webcamStreamRef.current = stream;
+      registerLiveStream('webcam', stream);
 
       if (idVideoRef.current) {
         idVideoRef.current.srcObject = stream;
       }
 
-      if (webcamVideoRef.current) {
-        webcamVideoRef.current.srcObject = stream;
-      }
-
       setWebcamReady(true);
-      setCamReady(stream.getVideoTracks().length > 0);
-      setMicReady(stream.getAudioTracks().length > 0);
       setErrorMsg('');
+      syncMediaStatus({ webcam: true, microphone: stream.getAudioTracks().length > 0 });
     } catch (error) {
       console.error('웹캠 연결 오류:', error);
       setWebcamReady(false);
-      setCamReady(false);
-      setMicReady(false);
       setErrorMsg('웹캠 및 마이크 권한을 허용해야 합니다.');
     }
   };
@@ -243,6 +235,7 @@ export default function ExamCheckPage() {
       });
 
       displayStreamRef.current = stream;
+      registerLiveStream('screen', stream);
 
       if (displayRef.current) {
         displayRef.current.srcObject = stream;
@@ -250,11 +243,13 @@ export default function ExamCheckPage() {
 
       setDisplayReady(true);
       setErrorMsg('');
+      syncMediaStatus({ screen: true });
 
       const videoTrack = stream.getVideoTracks()[0];
       if (videoTrack) {
         videoTrack.onended = () => {
           setDisplayReady(false);
+          syncMediaStatus({ screen: false });
         };
       }
     } catch (error) {
@@ -265,14 +260,15 @@ export default function ExamCheckPage() {
   };
 
   const toggleQrConnection = () => {
-    setQrConnected((previous) => !previous);
+    setQrConnected((previous) => {
+      syncMediaStatus({ auxiliaryCamera: !previous });
+      return !previous;
+    });
     setErrorMsg('');
   };
 
   const isAllReady =
     webcamReady &&
-    camReady &&
-    micReady &&
     Boolean(idCardImage) &&
     displayReady &&
     qrConnected;
@@ -337,43 +333,11 @@ export default function ExamCheckPage() {
           )}
         </div>
 
-        {/* 2. 웹캠/마이크 연결 */}
-        <div className="card">
-          <div className="card-header">
-            <div className="check-card-title">
-              <Mic size={20} color="#2563EB" />
-              <h3>2. 웹캠/마이크 연결</h3>
-            </div>
-            {camReady && micReady && <CheckCircle2 color="#16a34a" />}
-          </div>
-
-          <div className="video-box">
-            <video ref={webcamVideoRef} autoPlay playsInline muted className="video-stream" />
-            {!webcamReady && <span className="video-placeholder">웹캠과 마이크가 연결되지 않았습니다.</span>}
-          </div>
-
-          <div className="identity-status-list">
-            <div>
-              <span>웹캠 연결</span>
-              <strong className={camReady ? 'text-success' : 'text-danger'}>{camReady ? '완료' : '대기'}</strong>
-            </div>
-            <div>
-              <span>마이크 연결</span>
-              <strong className={micReady ? 'text-success' : 'text-danger'}>{micReady ? '완료' : '대기'}</strong>
-            </div>
-          </div>
-
-          <button type="button" className="btn-primary identity-full-button" onClick={startWebcam}>
-            <Camera size={18} /> {webcamReady ? '웹캠/마이크 다시 연결' : '웹캠/마이크 연결하기'}
-          </button>
-        </div>
-
-        {/* 3. PC 화면 공유 */}
         <div className="card">
           <div className="card-header">
             <div className="check-card-title">
               <Monitor size={20} color="#2563EB" />
-              <h3>3. PC 화면 공유</h3>
+              <h3>2. PC 화면 공유</h3>
             </div>
             {displayReady && <CheckCircle2 color="#16a34a" />}
           </div>
@@ -385,6 +349,29 @@ export default function ExamCheckPage() {
 
           <button type="button" className="btn-primary identity-full-button" onClick={startDisplayShare}>
             <Monitor size={18} /> 화면 공유 권한 요청
+          </button>
+        </div>
+
+        <div className="card">
+          <div className="card-header">
+            <div className="check-card-title">
+              <Camera size={20} color="#2563EB" />
+              <h3>3. 웹캠·마이크 연결 확인</h3>
+            </div>
+            {webcamReady && <CheckCircle2 color="#16a34a" />}
+          </div>
+
+          <div className="video-box">
+            <video ref={idVideoRef} autoPlay playsInline muted className="video-stream" />
+            {!webcamReady && <span className="video-placeholder">웹캠과 마이크가 연결되지 않았습니다.</span>}
+          </div>
+
+          <div className="identity-status-list">
+            <div><span>웹캠</span><strong className={webcamReady ? 'text-success' : 'text-danger'}>{webcamReady ? '연결됨' : '대기'}</strong></div>
+            <div><span>마이크</span><strong className={webcamReady ? 'text-success' : 'text-danger'}>{webcamReady ? '연결됨' : '대기'}</strong></div>
+          </div>
+          <button type="button" className="btn-primary identity-full-button" onClick={startWebcam}>
+            <Camera size={18} /> {webcamReady ? '웹캠/마이크 다시 연결' : '웹캠/마이크 연결하기'}
           </button>
         </div>
 
@@ -435,7 +422,7 @@ export default function ExamCheckPage() {
             신분증: <strong className={idCardImage ? 'text-success' : 'text-danger'}>{idCardImage ? '촬영 완료' : '미촬영'}</strong>
           </span>
           <span>
-            웹캠/마이크: <strong className={camReady && micReady ? 'text-success' : 'text-danger'}>{camReady && micReady ? '연결됨' : '미완료'}</strong>
+            웹캠/마이크: <strong className={webcamReady ? 'text-success' : 'text-danger'}>{webcamReady ? '연결됨' : '미연결'}</strong>
           </span>
           <span>
             화면 공유: <strong className={displayReady ? 'text-success' : 'text-danger'}>{displayReady ? '연결됨' : '미완료'}</strong>
