@@ -459,7 +459,7 @@ export default function ManagerExamDetailPage() {
       );
     }
   };
-
+  
   const sendInvitations = async () => {
     if (selectedCandidateIds.some((candidateId) => !scopedCandidates.find((candidate) => candidate.id === candidateId)?.birthDate)) {
       showMessage("신분 인증을 위해 생년월일이 없는 응시자의 정보를 먼저 수정해주세요.", "error");
