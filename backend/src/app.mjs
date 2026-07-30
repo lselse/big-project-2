@@ -132,6 +132,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
   const sessions = new Map(store.sessions.map((session) => [session.tokenHash, session]));
   const loginFailures = new Map();
   const candidateFailures = new Map();
+  const devicePairings = new Map(); // 모바일 기기 페어링 상태 (tokenHash -> connectedAt)
   const app = express();
   const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS ?? "http://localhost:5173,http://localhost:5174").split(",").map((origin) => origin.trim()).filter(Boolean));
   const publicWebOrigin = process.env.PUBLIC_WEB_ORIGIN || (process.env.RENDER === "true" ? "https://aivle-frontend-gakg.onrender.com" : "http://localhost:5173");
@@ -247,6 +248,15 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
   app.get("/api/health", (_request, response) => response.json({ status: "ok" }));
   app.get("/api/exams", (_request, response) => response.status(403).json({ message: "시험은 초대 메일의 링크로만 입장할 수 있습니다." }));
   app.get("/api/notices", (_request, response) => response.json(store.notices));
+
+  // 모바일 기기 페어링 (측면 보조 카메라 QR 연동)
+  app.post("/api/device-pairing/:token/connect", (request, response) => {
+    devicePairings.set(hashToken(request.params.token), { connectedAt: new Date().toISOString() });
+    return response.sendStatus(204);
+  });
+  app.get("/api/device-pairing/:token", (request, response) => {
+    return response.json({ connected: devicePairings.has(hashToken(request.params.token)) });
+  });
 
   app.post("/api/auth/email-verification/send", async (request, response, next) => {
     try {

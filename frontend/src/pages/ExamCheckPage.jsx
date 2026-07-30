@@ -86,6 +86,19 @@ export default function ExamCheckPage() {
     };
   }, []);
 
+  // 폰이 실제로 QR을 스캔해 연결하면 서버에 물어봐서 자동 감지
+  useEffect(() => {
+    if (!auxCamToken || qrConnected) return;
+    const interval = setInterval(() => {
+      api.get(`/device-pairing/${auxCamToken}`)
+        .then(({ data }) => {
+          if (data.connected) setQrConnected(true);
+        })
+        .catch(() => {});
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [auxCamToken, qrConnected]);
+
   // 토큰 생성 함수
   const generateNewToken = () => {
     const generate = () => window.crypto.randomUUID ? window.crypto.randomUUID() : `${Math.random().toString(36).substring(2)}-${Date.now().toString(36)}`;
