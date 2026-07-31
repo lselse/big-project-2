@@ -2188,3 +2188,78 @@ main {
 .community-comment button { border: 0; background: transparent; color: #94a3b8; cursor: pointer; }
 .community-comments form { display: flex; gap: .5rem; margin-top: 1rem; }
 .community-comments form input { flex: 1; }
+
+/* =========================================================
+   10. 미적용 클래스 보완 (CSS 통일)
+   ========================================================= */
+
+/* community-shell / notice-page: 폼 패널과 목록 패널이 같은 shell 안에서
+   바로 이어질 때 간격이 없어 패널이 맞닿아 보이는 문제 보정 */
+.community-shell > .data-panel + .data-panel,
+.notice-page > .data-panel + .data-panel {
+  margin-top: 20px;
+}
+
+/* AdminGovernanceTab: 조직 관리자 목록(.organization-row 안의 <small> 나열)이
+   flex/gap 없이 인라인으로 붙어 나오던 부분 */
+.organization-managers {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 2px;
+}
+.organization-managers small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* AiConfigTab: 사용량/요청 테이블에 클래스만 있고 정의가 없던 부분
+   (기존 .status-table 컨벤션 그대로 재사용) */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+  font-size: 13px;
+}
+.data-table th,
+.data-table td {
+  padding: 12px;
+  border-bottom: 1px solid var(--border-default);
+  vertical-align: top;
+}
+.data-table th {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+/* AiConfigTab: 제공자/모델 선택 2열 그리드 (.form-row와 동일 패턴) */
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+/* HomeTab 히어로 코드 목업: 지금은 className은 있지만 스타일이 전부
+   인라인 style={{...}}로만 중복 적용되고 있음. 아래 두 규칙을 추가하면
+   HomeTab.jsx의 .dot-group, .code-line 관련 inline style을 모두 제거해도
+   동일하게 렌더링됨 (색상은 이미 있는 .text-muted/.text-purple/.text-green 재사용) */
+.dot-group {
+  display: flex;
+  gap: 6px;
+}
+.code-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.code-line.text-muted,
+.code-line.text-purple,
+.code-line.text-green {
+  padding-left: 1.5rem;
+}
+
+/* ManagerExamDetailPage: floating-action-bar를 sticky 없이 고정 배치로
+   쓰고 싶을 때 붙이는 .static 수정자 클래스가 정의돼 있지 않았음 */
+.floating-action-bar.static {
+  position: static;
+}
