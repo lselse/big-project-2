@@ -14,9 +14,13 @@ const collectionDefaults = {
   questions: [],
   assignments: [],
   codingSubmissions: [],
+  communityPosts: [],
+  communityComments: [],
   invitations: [],
   invitationAuditLogs: [],
   warnings: [],
+  auxiliaryDevices: [],
+  idCardScans: [],
   organizationJoinRequests: [],
   sessions: [],
   emailVerifications: [],
@@ -150,6 +154,18 @@ export const createStore = async (filePath) => {
       data = { ...data, questions: clone(seedData.questions) };
       shouldSave = true;
     }
+    const legacyDemoQuestion = data.questions.find((question) => question.examId === "exam-2026-second-half" && question.type === "CODING" && question.title === "123");
+    const seededDemoQuestions = seedData.questions.filter((question) => question.id === "coding-example-1" || question.id === "coding-example-2");
+    if (legacyDemoQuestion && !seededDemoQuestions.every((demo) => data.questions.some((question) => question.id === demo.id))) {
+      data = {
+        ...data,
+        questions: [
+          ...data.questions.filter((question) => question.id !== legacyDemoQuestion.id && !seededDemoQuestions.some((demo) => demo.id === question.id)),
+          ...clone(seededDemoQuestions)
+        ]
+      };
+      shouldSave = true;
+    }
     const migratedUsers = data.users.map((user) => user.role === "SUPERVISOR" ? { ...user, role: "MANAGER", name: user.name === "감독관" ? "김관리자" : user.name, organizationIds: user.organizationIds ?? data.organizations.filter((organization) => organization.managerIds?.includes(user.id)).map((organization) => organization.id) } : user);
     if (migratedUsers.some((user, index) => user.role !== data.users[index].role || user.name !== data.users[index].name)) {
       data = { ...data, users: migratedUsers };
@@ -210,7 +226,11 @@ const save = async () => {
     get users() { return data.users; },
     get exams() { return data.exams; },
     get notices() { return data.notices; },
+    get communityPosts() { return data.communityPosts; },
+    get communityComments() { return data.communityComments; },
     get warnings() { return data.warnings; },
+    get auxiliaryDevices() { return data.auxiliaryDevices; },
+    get idCardScans() { return data.idCardScans; },
     get examinees() { return data.examinees; },
     get organizations() { return data.organizations; },
     get candidates() { return data.candidates; },
@@ -275,6 +295,94 @@ const save = async () => {
       data.warnings.push(warning);
       await queuedSave();
     },
+    addAuxiliaryDevice: async (device) => {
+      data.auxiliaryDevices = data.auxiliaryDevices.filter((item) => item.expiresAt > Date.now());
+      data.auxiliaryDevices.push(device);
+      await queuedSave();
+      return device;
+    },
+    updateAuxiliaryDevice: async (token, patch) => {
+      const device = data.auxiliaryDevices.find((item) => item.token === token);
+      if (!device) return undefined;
+      Object.assign(device, patch);
+      await queuedSave();
+      return device;
+    },
+    addIdCardScan: async (scan) => {
+      data.idCardScans = data.idCardScans.filter((item) => item.expiresAt > Date.now());
+      data.idCardScans.push(scan);
+      await queuedSave();
+      return scan;
+    },
+    updateIdCardScan: async (token, patch) => {
+      const scan = data.idCardScans.find((item) => item.token === token);
+      if (!scan) return undefined;
+      Object.assign(scan, patch);
+      await queuedSave();
+      return scan;
+    },
+    removeAuxiliaryDevices: async (examId, candidateId) => {
+      data.auxiliaryDevices = data.auxiliaryDevices.filter((item) => item.examId !== examId || item.candidateId !== candidateId);
+      await queuedSave();
+    },
+    addNotice: async (notice) => {
+      data.notices.unshift(notice);
+      await queuedSave();
+      return notice;
+    },
+    updateNotice: async (id, patch) => {
+      const notice = data.notices.find((item) => item.id === id);
+      if (!notice) return undefined;
+      Object.assign(notice, patch);
+      await queuedSave();
+      return notice;
+    },
+    removeNotice: async (id) => {
+      const index = data.notices.findIndex((item) => item.id === id);
+      if (index < 0) return undefined;
+      const [removed] = data.notices.splice(index, 1);
+      await queuedSave();
+      return removed;
+    },
+    addCommunityPost: async (post) => {
+      data.communityPosts.unshift(post);
+      await queuedSave();
+      return post;
+    },
+    updateCommunityPost: async (id, patch) => {
+      const post = data.communityPosts.find((item) => item.id === id);
+      if (!post) return undefined;
+      Object.assign(post, patch);
+      await queuedSave();
+      return post;
+    },
+    removeCommunityPost: async (id) => {
+      const index = data.communityPosts.findIndex((item) => item.id === id);
+      if (index < 0) return undefined;
+      const [removed] = data.communityPosts.splice(index, 1);
+      data.communityComments = data.communityComments.filter((item) => item.postId !== id);
+      await queuedSave();
+      return removed;
+    },
+    addCommunityComment: async (comment) => {
+      data.communityComments.push(comment);
+      await queuedSave();
+      return comment;
+    },
+    updateCommunityComment: async (id, patch) => {
+      const comment = data.communityComments.find((item) => item.id === id);
+      if (!comment) return undefined;
+      Object.assign(comment, patch);
+      await queuedSave();
+      return comment;
+    },
+    removeCommunityComment: async (id) => {
+      const index = data.communityComments.findIndex((item) => item.id === id);
+      if (index < 0) return undefined;
+      const [removed] = data.communityComments.splice(index, 1);
+      await queuedSave();
+      return removed;
+    },
     addOrganization: async (organization) => {
       data.organizations.unshift(organization);
       await queuedSave();
@@ -325,6 +433,13 @@ const save = async () => {
       Object.assign(question, patch);
       await queuedSave();
       return question;
+    },
+    removeQuestion: async (id) => {
+      const questionIndex = data.questions.findIndex((question) => question.id === id);
+      if (questionIndex < 0) return false;
+      data.questions.splice(questionIndex, 1);
+      await queuedSave();
+      return true;
     },
     addAssignment: async (assignment) => {
       data.assignments.push(assignment);

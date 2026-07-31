@@ -68,6 +68,74 @@ const isValidBirthDate = (value) => {
   const date = new Date(Date.UTC(year, month - 1, day));
   return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day && date <= new Date();
 };
+const normalizeResidentNumberFront = (value) => {
+  const digits = String(value ?? "").replace(/\D/g, "");
+  if (/^\d{6}$/.test(digits)) return digits;
+  if (/^\d{8}$/.test(digits)) return digits.slice(-6);
+  return "";
+};
+const residentNumberFrontFromOcr = (payload) => {
+  const candidate = payload?.residentNumberFront
+    ?? payload?.birthDate
+    ?? payload?.data?.residentNumberFront
+    ?? payload?.data?.birthDate
+    ?? payload?.result?.residentNumberFront
+    ?? payload?.result?.birthDate;
+  return normalizeResidentNumberFront(candidate);
+};
+const normalizeIdentityName = (value) => String(value ?? "").replace(/\s/g, "").toLowerCase();
+const nameMatchedFromOcr = (payload, expectedName) => {
+  if (payload?.nameMatched === true) return true;
+  const recognizedName = payload?.name ?? payload?.data?.name ?? payload?.result?.name;
+  const recognizedText = payload?.recognizedText ?? payload?.text ?? payload?.data?.recognizedText ?? payload?.result?.recognizedText;
+  const expected = normalizeIdentityName(expectedName);
+  return normalizeIdentityName(recognizedName) === expected || normalizeIdentityName(recognizedText).includes(expected);
+};
+const requestIdCardOcr = async (path, payload) => {
+  const configuredEndpoint = process.env.ID_CARD_OCR_URL?.trim().replace(/\/$/, "");
+  const baseEndpoint = configuredEndpoint?.replace(/\/ocr\/id-card(?:\/detect)?$/, "");
+  if (!baseEndpoint) {
+    const error = new Error("신분증 OCR 모델이 아직 설정되지 않았습니다. 서버 환경변수 ID_CARD_OCR_URL을 등록해주세요.");
+    error.status = 503;
+    throw error;
+  }
+  const headers = { "Content-Type": "application/json" };
+  const apiKey = process.env.ID_CARD_OCR_API_KEY?.trim();
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  let ocrResponse;
+  try {
+    ocrResponse = await fetch(`${baseEndpoint}${path}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(180_000)
+    });
+  } catch (reason) {
+    const error = new Error(reason?.name === "TimeoutError"
+      ? "OCR 모델을 준비하는 데 시간이 오래 걸리고 있습니다. 잠시 후 다시 촬영해주세요."
+      : "신분증 OCR 서비스에 연결하지 못했습니다. OCR 서비스 배포 상태와 주소를 확인해주세요.");
+    error.status = 503;
+    throw error;
+  }
+  if (!ocrResponse.ok) {
+    const result = await ocrResponse.json().catch(() => ({}));
+    const error = new Error(typeof result?.detail === "string" ? result.detail : "신분증 OCR 모델이 이미지를 처리하지 못했습니다.");
+    error.status = ocrResponse.status >= 500 ? 502 : ocrResponse.status;
+    throw error;
+  }
+  return ocrResponse.json();
+};
+const verifyIdCardWithOcr = async (image, expectedName) => {
+  const payload = await requestIdCardOcr("/ocr/id-card", { image, expectedName });
+  const residentNumberFront = residentNumberFrontFromOcr(payload);
+  if (!residentNumberFront) {
+    const error = new Error("신분증에서 주민번호 앞 6자리를 읽지 못했습니다. 빛 반사를 피해서 다시 촬영해주세요.");
+    error.status = 422;
+    throw error;
+  }
+  return { residentNumberFront, nameMatched: nameMatchedFromOcr(payload, expectedName) };
+};
+const detectIdCardWithOcr = async (image) => requestIdCardOcr("/ocr/id-card/detect", { image });
 const invitationForToken = (invitations, token) => invitations.find((invitation) => invitation.tokenHash === hashToken(token));
 const codingLanguages = new Set(["Python", "Java", "JavaScript"]);
 const judgeModes = new Set(["EXACT", "IGNORE_WHITESPACE", "NUMERIC_TOLERANCE", "CUSTOM"]);
@@ -82,7 +150,8 @@ const normalizeTestCases = (testCases, requireAtLeastOne = false) => {
   return normalized;
 };
 const publicQuestion = ({ answer, hiddenTestCases, referenceSolutions, customJudgeCode, ...question }) => question;
-const normalizeCodingAnswers = (answers, questions) => Object.fromEntries(questions.filter((question) => question.type === "CODING").map((question) => {
+const normalizeCodingAnswers = (answers, questions) => Object.fromEntries(questions.map((question) => {
+  if (question.type !== "CODING") return [question.id, typeof answers[question.id] === "string" ? answers[question.id].slice(0, 10000) : ""];
   const answer = answers[question.id] && typeof answers[question.id] === "object" ? answers[question.id] : {};
   const languages = question.languages?.length ? question.languages : ["Python"];
   return [question.id, {
@@ -133,6 +202,8 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
   const loginFailures = new Map();
   const candidateFailures = new Map();
   const liveSessions = new Map();
+  const auxiliaryDevices = new Map(store.auxiliaryDevices.map((device) => [device.token, device]));
+  const idCardScans = new Map(store.idCardScans.map((scan) => [scan.token, scan]));
   const app = express();
   const allowedOrigins = new Set((process.env.ALLOWED_ORIGINS ?? "http://localhost:5173,http://localhost:5174").split(",").map((origin) => origin.trim()).filter(Boolean));
   const publicWebOrigin = process.env.PUBLIC_WEB_ORIGIN || (process.env.RENDER === "true" ? "https://aivle-frontend-gakg.onrender.com" : "http://localhost:5173");
@@ -274,12 +345,13 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
     }
   };
 
-  app.use(express.json({ limit: "1mb" }));
+  app.use(express.json({ limit: "6mb" }));
+  app.use(express.urlencoded({ extended: false }));
   app.use((request, response, next) => {
     const origin = request.header("origin");
     if (origin && allowedOrigins.has(origin)) response.setHeader("Access-Control-Allow-Origin", origin);
     response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PATCH,DELETE,OPTIONS");
+    response.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
     response.setHeader("Vary", "Origin");
     if (request.method === "OPTIONS") return response.sendStatus(204);
     return next();
@@ -287,7 +359,72 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
 
   app.get("/api/health", (_request, response) => response.json({ status: "ok" }));
   app.get("/api/exams", (_request, response) => response.status(403).json({ message: "시험은 초대 메일의 링크로만 입장할 수 있습니다." }));
-  app.get("/api/notices", (_request, response) => response.json(store.notices));
+  const publicNotice = (notice) => ({
+    id: notice.id,
+    title: notice.title,
+    content: notice.content ?? "",
+    category: notice.category ?? "GENERAL",
+    scope: notice.scope ?? "GLOBAL",
+    organizationId: notice.organizationId ?? null,
+    examId: notice.examId ?? null,
+    organizationName: notice.organizationId ? store.organizations.find((item) => item.id === notice.organizationId)?.name ?? null : null,
+    examTitle: notice.examId ? store.exams.find((item) => item.id === notice.examId)?.title ?? null : null,
+    pinned: Boolean(notice.pinned),
+    publishedAt: notice.publishedAt ?? notice.date ?? null,
+    publishStartAt: notice.publishStartAt ?? null,
+    publishEndAt: notice.publishEndAt ?? null,
+    viewCount: notice.viewCount ?? 0,
+    createdAt: notice.createdAt ?? null,
+    updatedAt: notice.updatedAt ?? null
+  });
+  const isPublishedNotice = (notice, now = new Date()) =>
+    (!notice.publishStartAt || new Date(notice.publishStartAt) <= now)
+    && (!notice.publishEndAt || new Date(notice.publishEndAt) >= now);
+  const noticeSort = (first, second) =>
+    Number(Boolean(second.pinned)) - Number(Boolean(first.pinned))
+    || new Date(second.publishedAt ?? second.date ?? 0) - new Date(first.publishedAt ?? first.date ?? 0);
+  const normalizeNoticeInput = (body) => {
+    const title = typeof body.title === "string" ? body.title.trim() : "";
+    const content = typeof body.content === "string" ? body.content.trim() : "";
+    const categories = new Set(["GENERAL", "EXAM", "MAINTENANCE", "URGENT"]);
+    const category = categories.has(body.category) ? body.category : "GENERAL";
+    const parseOptionalDate = (value) => {
+      if (!value) return null;
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+    };
+    return {
+      title,
+      content,
+      category,
+      pinned: body.pinned === true,
+      publishStartAt: parseOptionalDate(body.publishStartAt),
+      publishEndAt: parseOptionalDate(body.publishEndAt)
+    };
+  };
+
+  app.get("/api/notices", (request, response) => {
+    const query = String(request.query.q ?? "").trim().toLowerCase();
+    const category = String(request.query.category ?? "").trim();
+    const notices = store.notices
+      .filter((notice) => (notice.scope ?? "GLOBAL") === "GLOBAL")
+      .filter((notice) => isPublishedNotice(notice))
+      .filter((notice) => !category || category === "ALL" || (notice.category ?? "GENERAL") === category)
+      .filter((notice) => !query || `${notice.title} ${notice.content ?? ""}`.toLowerCase().includes(query))
+      .sort(noticeSort)
+      .map(publicNotice);
+    response.json(notices);
+  });
+  app.get("/api/notices/:id", async (request, response, next) => {
+    try {
+      const notice = store.notices.find((item) => item.id === request.params.id);
+      if (!notice || (notice.scope ?? "GLOBAL") !== "GLOBAL" || !isPublishedNotice(notice)) return response.status(404).json({ message: "공지사항을 찾을 수 없습니다." });
+      const updated = await store.updateNotice(notice.id, { viewCount: (notice.viewCount ?? 0) + 1 });
+      return response.json(publicNotice(updated));
+    } catch (error) {
+      return next(error);
+    }
+  });
 
   app.post("/api/auth/email-verification/send", async (request, response, next) => {
     try {
@@ -351,7 +488,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
       const user = { id: randomUUID(), name: name.trim(), email, password, role: "MANAGER", approvalStatus: "PENDING", organizationIds: [] };
       await store.addUser(user);
       await store.updateEmailVerification(verification.id, { consumedAt: new Date().toISOString() });
-      return response.status(201).json({ user: publicUser(user), message: "관리자 가입 신청이 접수되었습니다. ADMIN 승인 후 로그인할 수 있습니다." });
+      return response.status(201).json({ user: publicUser(user), message: "관리자 가입 신청이 접수되었습니다. 관리자 승인 후 로그인할 수 있습니다." });
     } catch (error) {
       return next(error);
     }
@@ -367,7 +504,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
       const user = store.users.find((candidate) => candidate.email === email);
       const roleMatches = user && (!role || user.role === role || (isManagerRole(user.role) && isManagerRole(role)));
       if (!roleMatches || user.role === "APPLICANT" || role === "APPLICANT" || user.approvalStatus !== "APPROVED" || !(await verifyPassword(password ?? "", user.passwordHash))) {
-        if (user && user.approvalStatus !== "APPROVED") return response.status(403).json({ message: "ADMIN 승인 후 로그인할 수 있습니다." });
+        if (user && user.approvalStatus !== "APPROVED") return response.status(403).json({ message: "관리자 승인 후 로그인할 수 있습니다." });
         const failures = (loginFailures.get(key)?.failures ?? 0) + 1;
         loginFailures.set(key, { failures, blockedUntil: failures >= loginFailureLimit ? Date.now() + loginLockoutMs : 0 });
         return response.status(401).json({ message: "이메일, 비밀번호 또는 권한을 확인해주세요." });
@@ -408,6 +545,61 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
     request.applicantSession = { session, invitation, candidate, exam };
     return next();
   };
+  const authenticateApplicantBeacon = (request, response, next) => {
+    const accessToken = typeof request.body?.accessToken === "string" ? request.body.accessToken : "";
+    if (accessToken && !request.header("authorization")) request.headers.authorization = "Bearer " + accessToken;
+    return authenticateApplicant(request, response, next);
+  };
+  const recordMediaDisconnectWarnings = async (examinee, nextMediaStatus) => {
+    const previousMediaStatus = examinee.mediaStatus ?? {};
+    const labels = {
+      webcam: "웹캠 연결이 끊겼습니다.",
+      microphone: "마이크 연결이 끊겼습니다.",
+      screen: "PC 화면 공유가 중단되었습니다.",
+      auxiliaryCamera: "모바일 보조 카메라 연결이 끊겼습니다."
+    };
+    for (const [key, message] of Object.entries(labels)) {
+      if (previousMediaStatus[key] && !nextMediaStatus[key]) {
+        await store.addWarning({ id: randomUUID(), examineeId: examinee.id, examId: examinee.examId, organizationId: examinee.organizationId, message, createdAt: new Date().toISOString() });
+      }
+    }
+  };
+  const disconnectApplicantMedia = async ({ candidate, exam, recordWarnings = true }) => {
+    const updatedAt = new Date().toISOString();
+    for (const [id, liveSession] of liveSessions) {
+      if (liveSession.examId === exam.id && liveSession.candidateId === candidate.id) liveSessions.delete(id);
+    }
+    for (const device of auxiliaryDevices.values()) {
+      if (device.examId !== exam.id || device.candidateId !== candidate.id) continue;
+      device.deviceToken = null;
+      await store.updateAuxiliaryDevice(device.token, { deviceToken: null });
+    }
+    const examinee = store.examinees.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
+    if (examinee) {
+      const disconnectedMediaStatus = { webcam: false, microphone: false, screen: false, auxiliaryCamera: false, updatedAt };
+      if (recordWarnings) await recordMediaDisconnectWarnings(examinee, disconnectedMediaStatus);
+      await store.updateExaminee(examinee.id, {
+        mediaStatus: disconnectedMediaStatus,
+        monitoringSnapshot: null,
+        auxiliarySnapshot: null
+      });
+    }
+  };
+  const staleMediaStatusTimer = setInterval(() => {
+    void (async () => {
+      const cutoff = Date.now() - 30_000;
+      for (const examinee of store.examinees) {
+        const mediaStatus = examinee.mediaStatus ?? {};
+        const updatedAt = Date.parse(mediaStatus.updatedAt ?? "");
+        const hasActiveMedia = mediaStatus.webcam || mediaStatus.microphone || mediaStatus.screen || mediaStatus.auxiliaryCamera;
+        if (!hasActiveMedia || Number.isNaN(updatedAt) || updatedAt > cutoff) continue;
+        const disconnectedMediaStatus = { webcam: false, microphone: false, screen: false, auxiliaryCamera: false, updatedAt: new Date().toISOString() };
+        await recordMediaDisconnectWarnings(examinee, disconnectedMediaStatus);
+        await store.updateExaminee(examinee.id, { mediaStatus: disconnectedMediaStatus, monitoringSnapshot: null, auxiliarySnapshot: null });
+      }
+    })().catch((error) => console.error("Stale media status cleanup failed", error));
+  }, 10_000);
+  staleMediaStatusTimer.unref?.();
   app.post("/api/auth/logout", authenticate, async (request, response) => {
     const token = request.header("authorization")?.replace("Bearer ", "");
     if (token) {
@@ -421,23 +613,244 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
     const { invitation, candidate, exam } = request.applicantSession;
     return response.json({ exam: { id: exam.id, title: exam.title, duration: exam.duration, questions: exam.questions, date: exam.date }, candidate: { name: candidate.name, candidateNumber: candidate.candidateNumber }, expiresAt: invitation.expiresAt });
   });
+  app.get("/api/applicant/notices", authenticateApplicant, (request, response) => {
+    const { exam } = request.applicantSession;
+    return response.json(store.notices
+      .filter((notice) => {
+        const scope = notice.scope ?? "GLOBAL";
+        return scope === "GLOBAL"
+          || (scope === "ORGANIZATION" && notice.organizationId === exam.organizationId)
+          || (scope === "EXAM" && notice.examId === exam.id);
+      })
+      .filter((notice) => isPublishedNotice(notice))
+      .sort(noticeSort)
+      .map(publicNotice));
+  });
+  app.get("/api/applicant/notices/:id", authenticateApplicant, async (request, response, next) => {
+    try {
+      const { exam } = request.applicantSession;
+      const notice = store.notices.find((item) => item.id === request.params.id);
+      const scope = notice?.scope ?? "GLOBAL";
+      const canView = notice && (
+        scope === "GLOBAL"
+        || (scope === "ORGANIZATION" && notice.organizationId === exam.organizationId)
+        || (scope === "EXAM" && notice.examId === exam.id)
+      );
+      if (!canView || !isPublishedNotice(notice)) return response.status(404).json({ message: "공지사항을 찾을 수 없습니다." });
+      const updated = await store.updateNotice(notice.id, { viewCount: (notice.viewCount ?? 0) + 1 });
+      return response.json(publicNotice(updated));
+    } catch (error) {
+      return next(error);
+    }
+  });
   app.put("/api/applicant/media-status", authenticateApplicant, async (request, response, next) => {
     try {
       const { candidate, exam } = request.applicantSession;
       const media = request.body.media && typeof request.body.media === "object" ? request.body.media : {};
+      let examinee = store.examinees.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
       const mediaStatus = {
         webcam: Boolean(media.webcam),
         microphone: Boolean(media.microphone),
         screen: Boolean(media.screen),
-        auxiliaryCamera: Boolean(media.auxiliaryCamera),
+        auxiliaryCamera: typeof media.auxiliaryCamera === "boolean" ? media.auxiliaryCamera : Boolean(examinee?.mediaStatus?.auxiliaryCamera),
         updatedAt: new Date().toISOString()
       };
-      let examinee = store.examinees.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
+      const disconnecting = !mediaStatus.webcam && !mediaStatus.screen && !mediaStatus.auxiliaryCamera;
+      if (disconnecting) {
+        await disconnectApplicantMedia({ candidate, exam });
+        return response.json({ mediaStatus });
+      }
       if (!examinee) {
         examinee = { id: randomUUID(), candidateId: candidate.id, name: candidate.name, organizationId: exam.organizationId, examId: exam.id, status: "NORMAL", statusText: "시험 입장 완료", currentProb: "시험 시작 전", mediaStatus };
         await store.addExaminee(examinee);
-      } else await store.updateExaminee(examinee.id, { mediaStatus });
+      } else {
+        await recordMediaDisconnectWarnings(examinee, mediaStatus);
+        await store.updateExaminee(examinee.id, { mediaStatus, ...(disconnecting ? { monitoringSnapshot: null } : {}) });
+      }
       return response.json({ mediaStatus });
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.post("/api/applicant/media-disconnect", authenticateApplicantBeacon, async (request, response, next) => {
+    try {
+      await disconnectApplicantMedia(request.applicantSession);
+      return response.sendStatus(204);
+    } catch (error) {
+      return next(error);
+    }
+  });
+  const idCardScanResponse = (scan) => ({
+    status: scan.status,
+    verified: scan.status === "VERIFIED",
+    message: scan.message ?? ""
+  });
+  const submitIdCardScan = async (scan, image) => {
+    if (!image.startsWith("data:image/") || image.length > 5_000_000) {
+      const error = new Error("신분증 사진 형식이 올바르지 않거나 파일이 너무 큽니다.");
+      error.status = 400;
+      throw error;
+    }
+    const candidate = store.candidates.find((item) => item.id === scan.candidateId);
+    if (!candidate?.birthDate) {
+      const error = new Error("등록된 응시자 생년월일을 찾을 수 없습니다.");
+      error.status = 409;
+      throw error;
+    }
+    const ocrResult = await verifyIdCardWithOcr(image, candidate.name);
+    const expected = candidate.birthDate.replace(/-/g, "").slice(-6);
+    const birthDateMatched = ocrResult.residentNumberFront === expected;
+    const verified = birthDateMatched && ocrResult.nameMatched;
+    const updated = await store.updateIdCardScan(scan.token, {
+      status: verified ? "VERIFIED" : "MISMATCH",
+      message: verified ? "등록된 이름과 생년월일이 일치합니다." : !ocrResult.nameMatched ? "신분증 이름이 등록된 응시자 정보와 일치하지 않습니다." : "신분증 생년월일이 등록된 응시자 정보와 일치하지 않습니다.",
+      image: null,
+      capturedAt: new Date().toISOString()
+    });
+    Object.assign(scan, updated);
+    return idCardScanResponse(updated);
+  };
+  app.post("/api/applicant/id-card-scans", authenticateApplicant, async (request, response, next) => {
+    try {
+      const { candidate, exam } = request.applicantSession;
+      const scan = { token: randomUUID(), examId: exam.id, candidateId: candidate.id, status: "PENDING", expiresAt: Date.now() + 60 * 60 * 1000 };
+      idCardScans.set(scan.token, scan);
+      await store.addIdCardScan(scan);
+      return response.status(201).json({ token: scan.token });
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.get("/api/applicant/id-card-scans/:token", authenticateApplicant, (request, response) => {
+    const { candidate, exam } = request.applicantSession;
+    const scan = idCardScans.get(request.params.token);
+    if (!scan || scan.expiresAt <= Date.now() || scan.candidateId !== candidate.id || scan.examId !== exam.id) {
+      return response.status(404).json({ message: "신분증 QR 촬영 요청을 찾을 수 없습니다." });
+    }
+    return response.json(idCardScanResponse(scan));
+  });
+  app.post("/api/applicant/id-card-scans/:token/capture", authenticateApplicant, async (request, response, next) => {
+    try {
+      const { candidate, exam } = request.applicantSession;
+      const scan = idCardScans.get(request.params.token);
+      if (!scan || scan.expiresAt <= Date.now() || scan.candidateId !== candidate.id || scan.examId !== exam.id) {
+        return response.status(404).json({ message: "신분증 QR 촬영 요청을 찾을 수 없습니다." });
+      }
+      return response.json(await submitIdCardScan(scan, typeof request.body.image === "string" ? request.body.image : ""));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.post("/api/mobile-id-scans/:token/capture", async (request, response, next) => {
+    try {
+      const scan = idCardScans.get(request.params.token);
+      if (!scan || scan.expiresAt <= Date.now()) return response.status(404).json({ message: "만료되었거나 올바르지 않은 신분증 QR 코드입니다." });
+      return response.json(await submitIdCardScan(scan, typeof request.body.image === "string" ? request.body.image : ""));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.post("/api/mobile-id-scans/:token/detect", async (request, response, next) => {
+    try {
+      const scan = idCardScans.get(request.params.token);
+      if (!scan || scan.expiresAt <= Date.now()) return response.status(404).json({ message: "만료되었거나 올바르지 않은 신분증 QR 코드입니다." });
+      const image = typeof request.body.image === "string" ? request.body.image : "";
+      return response.json(await detectIdCardWithOcr(image));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.post("/api/applicant/auxiliary-devices", authenticateApplicant, async (request, response, next) => {
+    try {
+      const { candidate, exam } = request.applicantSession;
+      const token = randomUUID();
+      const device = { token, examId: exam.id, candidateId: candidate.id, expiresAt: Date.now() + 60 * 60 * 1000 };
+      auxiliaryDevices.set(token, device);
+      await store.addAuxiliaryDevice(device);
+      return response.status(201).json({ token });
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.get("/api/applicant/auxiliary-devices/:token", authenticateApplicant, (request, response) => {
+    const { candidate, exam } = request.applicantSession;
+    const device = auxiliaryDevices.get(request.params.token);
+    if (!device || device.examId !== exam.id || device.candidateId !== candidate.id || device.expiresAt <= Date.now()) return response.status(404).json({ message: "보조 카메라 연결 요청을 찾을 수 없습니다." });
+    return response.json({ connected: Boolean(device.deviceToken) });
+  });
+  app.post("/api/mobile-devices/pair", async (request, response, next) => {
+    try {
+      const token = typeof request.body.token === "string" ? request.body.token : "";
+      const device = auxiliaryDevices.get(token);
+      if (!device || device.expiresAt <= Date.now()) return response.status(404).json({ message: "만료되었거나 올바르지 않은 보조 카메라 QR 코드입니다." });
+      device.deviceToken ??= randomUUID();
+      await store.updateAuxiliaryDevice(device.token, { deviceToken: device.deviceToken });
+      const examinee = store.examinees.find((item) => item.examId === device.examId && item.candidateId === device.candidateId);
+      if (examinee) await store.updateExaminee(examinee.id, { mediaStatus: { ...(examinee.mediaStatus ?? {}), auxiliaryCamera: true, updatedAt: new Date().toISOString() } });
+      return response.json({ deviceToken: device.deviceToken });
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.get("/api/mobile-devices/:deviceToken/status", (request, response) => {
+    const device = [...auxiliaryDevices.values()].find((item) => item.deviceToken === request.params.deviceToken && item.expiresAt > Date.now());
+    if (!device) return response.json({ ended: true });
+    const assignment = store.assignments.find((item) => item.examId === device.examId && item.candidateId === device.candidateId);
+    const invitation = store.invitations.find((item) => item.examId === device.examId && item.candidateId === device.candidateId);
+    const examinee = store.examinees.find((item) => item.examId === device.examId && item.candidateId === device.candidateId);
+    const pcMediaEnded = Boolean(examinee?.mediaStatus?.updatedAt) && !examinee.mediaStatus.webcam && !examinee.mediaStatus.screen;
+    return response.json({ ended: assignment?.status === "SUBMITTED" || Boolean(invitation?.submittedAt) || pcMediaEnded });
+  });
+  app.get("/api/mobile-devices/:deviceToken/live-offers", (request, response) => {
+    const device = [...auxiliaryDevices.values()].find((item) => item.deviceToken === request.params.deviceToken && item.expiresAt > Date.now());
+    if (!device) return response.status(401).json({ message: "유효하지 않은 보조 카메라 연결입니다." });
+    const session = [...liveSessions.values()].find((item) => item.source === "auxiliary" && item.examId === device.examId && item.candidateId === device.candidateId && !item.answer && Date.now() - item.createdAt < 30000);
+    return response.json(session ? { id: session.id, offer: session.offer } : null);
+  });
+  app.post("/api/mobile-devices/:deviceToken/live-offers/:id/answer", (request, response) => {
+    const device = [...auxiliaryDevices.values()].find((item) => item.deviceToken === request.params.deviceToken && item.expiresAt > Date.now());
+    const session = liveSessions.get(request.params.id);
+    if (!device || !session || session.source !== "auxiliary" || session.examId !== device.examId || session.candidateId !== device.candidateId || typeof request.body.answer?.sdp !== "string") return response.status(404).json({ message: "보조 카메라 라이브 연결 요청을 찾을 수 없습니다." });
+    session.answer = request.body.answer;
+    return response.sendStatus(204);
+  });
+  app.put("/api/mobile-devices/:deviceToken/snapshot", async (request, response, next) => {
+    try {
+      const device = [...auxiliaryDevices.values()].find((item) => item.deviceToken === request.params.deviceToken && item.expiresAt > Date.now());
+      const image = typeof request.body.image === "string" ? request.body.image : "";
+      if (!device || !image.startsWith("data:image/") || image.length > 120000) return response.status(400).json({ message: "보조 카메라 화면 형식이 올바르지 않습니다." });
+      const examinee = store.examinees.find((item) => item.examId === device.examId && item.candidateId === device.candidateId);
+      if (examinee) {
+        const updatedAt = new Date().toISOString();
+        await store.updateExaminee(examinee.id, {
+          mediaStatus: { ...(examinee.mediaStatus ?? {}), auxiliaryCamera: true, updatedAt },
+          auxiliarySnapshot: { image, updatedAt }
+        });
+      }
+      return response.sendStatus(204);
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.post("/api/mobile-devices/:deviceToken/disconnect", async (request, response, next) => {
+    try {
+      const device = [...auxiliaryDevices.values()].find((item) => item.deviceToken === request.params.deviceToken);
+      if (!device) return response.sendStatus(204);
+      for (const [id, liveSession] of liveSessions) {
+        if (liveSession.source === "auxiliary" && liveSession.examId === device.examId && liveSession.candidateId === device.candidateId) liveSessions.delete(id);
+      }
+      const examinee = store.examinees.find((item) => item.examId === device.examId && item.candidateId === device.candidateId);
+      if (examinee) {
+        const mediaStatus = { ...(examinee.mediaStatus ?? {}), auxiliaryCamera: false, updatedAt: new Date().toISOString() };
+        await recordMediaDisconnectWarnings(examinee, mediaStatus);
+        await store.updateExaminee(examinee.id, {
+          mediaStatus,
+          auxiliarySnapshot: null
+        });
+      }
+      device.deviceToken = null;
+      await store.updateAuxiliaryDevice(device.token, { deviceToken: null });
+      return response.sendStatus(204);
     } catch (error) {
       return next(error);
     }
@@ -460,13 +873,13 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
   });
   app.get("/api/applicant/live-offers", authenticateApplicant, (request, response) => {
     const { candidate, exam } = request.applicantSession;
-    const session = [...liveSessions.values()].find((item) => item.examId === exam.id && item.candidateId === candidate.id && !item.answer && Date.now() - item.createdAt < 30000);
+    const session = [...liveSessions.values()].find((item) => item.source === "candidate" && item.examId === exam.id && item.candidateId === candidate.id && !item.answer && Date.now() - item.createdAt < 30000);
     return response.json(session ? { id: session.id, offer: session.offer } : null);
   });
   app.post("/api/applicant/live-offers/:id/answer", authenticateApplicant, (request, response) => {
     const { candidate, exam } = request.applicantSession;
     const session = liveSessions.get(request.params.id);
-    if (!session || session.examId !== exam.id || session.candidateId !== candidate.id || typeof request.body.answer?.sdp !== "string") return response.status(404).json({ message: "라이브 연결 요청을 찾을 수 없습니다." });
+    if (!session || session.source !== "candidate" || session.examId !== exam.id || session.candidateId !== candidate.id || typeof request.body.answer?.sdp !== "string") return response.status(404).json({ message: "라이브 연결 요청을 찾을 수 없습니다." });
     session.answer = request.body.answer;
     return response.sendStatus(204);
   });
@@ -534,7 +947,14 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
       if (assignment) await store.updateAssignment(assignment.id, { status: "SUBMITTED", score, resultStatus: codingQuestions.length ? "PENDING_REVIEW" : "SUBMITTED", submittedAt: now });
       await store.updateInvitation(invitation.id, { submittedAt: now });
       const examinee = store.examinees.find((item) => item.examId === exam.id && item.candidateId === candidate.id);
-      if (examinee) await store.updateExaminee(examinee.id, { status: "SUBMITTED", statusText: "제출 완료", currentProb: "제출 완료" });
+      await disconnectApplicantMedia({ candidate, exam, recordWarnings: false });
+      if (examinee) {
+        await store.updateExaminee(examinee.id, {
+          status: "SUBMITTED",
+          statusText: "제출 완료",
+          currentProb: "제출 완료"
+        });
+      }
       return response.json({ examId: exam.id, score, correctCount, totalCount: questions.length, status: "SUBMITTED", gradingStatus: codingQuestions.length ? "PENDING_REVIEW" : "COMPLETED" });
     } catch (error) {
       return next(error);
@@ -542,6 +962,66 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
   });
   app.get("/api/admin/users", authenticate, requireRole("ADMIN"), (_request, response) => {
     response.json(store.users.filter((user) => isManagerRole(user.role)).map(publicUser));
+  });
+  app.get("/api/admin/notices", authenticate, requireRole("ADMIN"), (_request, response) =>
+    response.json([...store.notices].sort(noticeSort).map(publicNotice)));
+  app.post("/api/admin/notices", authenticate, requireRole("ADMIN"), async (request, response, next) => {
+    try {
+      const input = normalizeNoticeInput(request.body);
+      if (!input.title || !input.content) return response.status(400).json({ message: "공지 제목과 내용을 입력해주세요." });
+      if (input.publishStartAt === undefined || input.publishEndAt === undefined) return response.status(400).json({ message: "게시 기간을 올바르게 입력해주세요." });
+      if (input.publishStartAt && input.publishEndAt && new Date(input.publishStartAt) > new Date(input.publishEndAt)) return response.status(400).json({ message: "게시 종료일은 시작일 이후여야 합니다." });
+      const now = new Date().toISOString();
+      const notice = await store.addNotice({ id: randomUUID(), ...input, scope: "GLOBAL", organizationId: null, examId: null, publishedAt: input.publishStartAt ?? now, viewCount: 0, authorId: request.user.id, createdAt: now, updatedAt: now });
+      return response.status(201).json(publicNotice(notice));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.patch("/api/admin/notices/:id", authenticate, requireRole("ADMIN"), async (request, response, next) => {
+    try {
+      const existing = store.notices.find((item) => item.id === request.params.id);
+      if (!existing) return response.status(404).json({ message: "공지사항을 찾을 수 없습니다." });
+      const input = normalizeNoticeInput({ ...existing, ...request.body });
+      if (!input.title || !input.content) return response.status(400).json({ message: "공지 제목과 내용을 입력해주세요." });
+      if (input.publishStartAt === undefined || input.publishEndAt === undefined) return response.status(400).json({ message: "게시 기간을 올바르게 입력해주세요." });
+      if (input.publishStartAt && input.publishEndAt && new Date(input.publishStartAt) > new Date(input.publishEndAt)) return response.status(400).json({ message: "게시 종료일은 시작일 이후여야 합니다." });
+      const notice = await store.updateNotice(existing.id, { ...input, publishedAt: input.publishStartAt ?? existing.publishedAt ?? existing.date ?? new Date().toISOString(), updatedAt: new Date().toISOString() });
+      return response.json(publicNotice(notice));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.delete("/api/admin/notices/:id", authenticate, requireRole("ADMIN"), async (request, response, next) => {
+    try {
+      const removed = await store.removeNotice(request.params.id);
+      if (!removed) return response.status(404).json({ message: "공지사항을 찾을 수 없습니다." });
+      return response.status(204).end();
+    } catch (error) {
+      return next(error);
+    }
+  });
+  const publicCommunityComment = (comment) => ({
+    ...comment,
+    authorName: store.users.find((user) => user.id === comment.authorId)?.name ?? "사용자"
+  });
+  const publicCommunityPost = (post, includeComments = false) => ({
+    ...post,
+    authorName: store.users.find((user) => user.id === post.authorId)?.name ?? "사용자",
+    organizationName: store.organizations.find((item) => item.id === post.organizationId)?.name ?? null,
+    examTitle: post.examId ? store.exams.find((item) => item.id === post.examId)?.title ?? null : null,
+    commentCount: store.communityComments.filter((item) => item.postId === post.id).length,
+    ...(includeComments ? { comments: store.communityComments.filter((item) => item.postId === post.id).map(publicCommunityComment) } : {})
+  });
+  app.get("/api/admin/community", authenticate, requireRole("ADMIN"), (_request, response) =>
+    response.json(store.communityPosts.map((post) => publicCommunityPost(post))));
+  app.delete("/api/admin/community/:id", authenticate, requireRole("ADMIN"), async (request, response, next) => {
+    try {
+      const removed = await store.removeCommunityPost(request.params.id);
+      return removed ? response.status(204).end() : response.status(404).json({ message: "게시글을 찾을 수 없습니다." });
+    } catch (error) {
+      return next(error);
+    }
   });
   app.patch("/api/admin/users/:id/status", authenticate, requireRole("ADMIN"), async (request, response, next) => {
     try {
@@ -888,8 +1368,174 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
     const organizationIds = managerOrganizationIds(request.user, store.organizations);
     response.json(store.exams.filter((exam) => organizationIds.includes(exam.organizationId)).map((exam) => ({
       ...exam,
-      questionCount: store.questions.filter((question) => question.examId === exam.id).length
+      organizationName: store.organizations.find((organization) => organization.id === exam.organizationId)?.name ?? "조직",
+      questionCount: store.questions.filter((question) => question.examId === exam.id).length,
+      examineeCount: store.assignments.filter((assignment) => assignment.examId === exam.id).length
     })));
+  });
+  app.get("/api/manager/notices", authenticate, requireManager, (request, response) => {
+    const organizationIds = managerOrganizationIds(request.user, store.organizations);
+    response.json(store.notices
+      .filter((notice) => notice.organizationId && organizationIds.includes(notice.organizationId))
+      .sort(noticeSort)
+      .map(publicNotice));
+  });
+  const managerNoticeTarget = (request) => {
+    const scope = request.body.scope === "EXAM" ? "EXAM" : "ORGANIZATION";
+    const organizationId = typeof request.body.organizationId === "string" ? request.body.organizationId : "";
+    const organizationIds = managerOrganizationIds(request.user, store.organizations);
+    if (!organizationIds.includes(organizationId)) return { error: "배정된 조직의 공지만 관리할 수 있습니다.", status: 403 };
+    if (scope === "EXAM") {
+      const exam = store.exams.find((item) => item.id === request.body.examId && item.organizationId === organizationId);
+      if (!exam) return { error: "선택한 조직에 속한 시험을 찾을 수 없습니다.", status: 400 };
+      return { scope, organizationId, examId: exam.id };
+    }
+    return { scope, organizationId, examId: null };
+  };
+  app.post("/api/manager/notices", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const target = managerNoticeTarget(request);
+      if (target.error) return response.status(target.status).json({ message: target.error });
+      const input = normalizeNoticeInput(request.body);
+      if (!input.title || !input.content) return response.status(400).json({ message: "공지 제목과 내용을 입력해주세요." });
+      if (input.publishStartAt === undefined || input.publishEndAt === undefined) return response.status(400).json({ message: "게시 기간을 올바르게 입력해주세요." });
+      if (input.publishStartAt && input.publishEndAt && new Date(input.publishStartAt) > new Date(input.publishEndAt)) return response.status(400).json({ message: "게시 종료일은 시작일 이후여야 합니다." });
+      const now = new Date().toISOString();
+      const notice = await store.addNotice({ id: randomUUID(), ...input, ...target, publishedAt: input.publishStartAt ?? now, viewCount: 0, authorId: request.user.id, createdAt: now, updatedAt: now });
+      return response.status(201).json(publicNotice(notice));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.patch("/api/manager/notices/:id", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const organizationIds = managerOrganizationIds(request.user, store.organizations);
+      const existing = store.notices.find((item) => item.id === request.params.id);
+      if (!existing) return response.status(404).json({ message: "공지사항을 찾을 수 없습니다." });
+      if (!existing.organizationId || !organizationIds.includes(existing.organizationId)) return response.status(403).json({ message: "다른 조직의 공지는 수정할 수 없습니다." });
+      const target = managerNoticeTarget(request);
+      if (target.error) return response.status(target.status).json({ message: target.error });
+      const input = normalizeNoticeInput({ ...existing, ...request.body });
+      if (!input.title || !input.content) return response.status(400).json({ message: "공지 제목과 내용을 입력해주세요." });
+      const notice = await store.updateNotice(existing.id, { ...input, ...target, publishedAt: input.publishStartAt ?? existing.publishedAt, updatedAt: new Date().toISOString() });
+      return response.json(publicNotice(notice));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.delete("/api/manager/notices/:id", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const organizationIds = managerOrganizationIds(request.user, store.organizations);
+      const existing = store.notices.find((item) => item.id === request.params.id);
+      if (!existing) return response.status(404).json({ message: "공지사항을 찾을 수 없습니다." });
+      if (!existing.organizationId || !organizationIds.includes(existing.organizationId)) return response.status(403).json({ message: "다른 조직의 공지는 삭제할 수 없습니다." });
+      await store.removeNotice(existing.id);
+      return response.status(204).end();
+    } catch (error) {
+      return next(error);
+    }
+  });
+  const managerCommunityPost = (request) => {
+    const organizationId = typeof request.body.organizationId === "string" ? request.body.organizationId : "";
+    const organizationIds = managerOrganizationIds(request.user, store.organizations);
+    if (!organizationIds.includes(organizationId)) return { error: "배정된 조직의 게시판만 이용할 수 있습니다.", status: 403 };
+    const examId = typeof request.body.examId === "string" && request.body.examId ? request.body.examId : null;
+    if (examId && !store.exams.some((exam) => exam.id === examId && exam.organizationId === organizationId)) {
+      return { error: "선택한 조직에 속한 시험을 찾을 수 없습니다.", status: 400 };
+    }
+    const categories = new Set(["GENERAL", "QUESTION", "RESOURCE", "SUGGESTION"]);
+    return {
+      organizationId,
+      examId,
+      category: categories.has(request.body.category) ? request.body.category : "GENERAL",
+      title: typeof request.body.title === "string" ? request.body.title.trim() : "",
+      content: typeof request.body.content === "string" ? request.body.content.trim() : ""
+    };
+  };
+  app.get("/api/manager/community", authenticate, requireManager, (request, response) => {
+    const organizationIds = managerOrganizationIds(request.user, store.organizations);
+    const query = String(request.query.q ?? "").trim().toLowerCase();
+    const category = String(request.query.category ?? "ALL");
+    response.json(store.communityPosts
+      .filter((post) => organizationIds.includes(post.organizationId))
+      .filter((post) => category === "ALL" || post.category === category)
+      .filter((post) => !query || `${post.title} ${post.content}`.toLowerCase().includes(query))
+      .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || new Date(b.updatedAt) - new Date(a.updatedAt))
+      .map((post) => ({ ...publicCommunityPost(post), canEdit: post.authorId === request.user.id })));
+  });
+  app.get("/api/manager/community/:id", authenticate, requireManager, (request, response) => {
+    const organizationIds = managerOrganizationIds(request.user, store.organizations);
+    const post = store.communityPosts.find((item) => item.id === request.params.id && organizationIds.includes(item.organizationId));
+    if (!post) return response.status(404).json({ message: "게시글을 찾을 수 없습니다." });
+    const payload = publicCommunityPost(post, true);
+    return response.json({
+      ...payload,
+      canEdit: post.authorId === request.user.id,
+      comments: payload.comments.map((comment) => ({ ...comment, canDelete: comment.authorId === request.user.id }))
+    });
+  });
+  app.post("/api/manager/community", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const input = managerCommunityPost(request);
+      if (input.error) return response.status(input.status).json({ message: input.error });
+      if (!input.title || !input.content) return response.status(400).json({ message: "제목과 내용을 입력해주세요." });
+      const now = new Date().toISOString();
+      const post = await store.addCommunityPost({ id: randomUUID(), ...input, authorId: request.user.id, status: "OPEN", pinned: false, createdAt: now, updatedAt: now });
+      return response.status(201).json(publicCommunityPost(post));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.patch("/api/manager/community/:id", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const post = store.communityPosts.find((item) => item.id === request.params.id);
+      if (!post) return response.status(404).json({ message: "게시글을 찾을 수 없습니다." });
+      if (post.authorId !== request.user.id) return response.status(403).json({ message: "본인이 작성한 게시글만 수정할 수 있습니다." });
+      const input = managerCommunityPost(request);
+      if (input.error) return response.status(input.status).json({ message: input.error });
+      if (!input.title || !input.content) return response.status(400).json({ message: "제목과 내용을 입력해주세요." });
+      const status = request.body.status === "RESOLVED" ? "RESOLVED" : "OPEN";
+      const updated = await store.updateCommunityPost(post.id, { ...input, status, updatedAt: new Date().toISOString() });
+      return response.json(publicCommunityPost(updated));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.delete("/api/manager/community/:id", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const post = store.communityPosts.find((item) => item.id === request.params.id);
+      if (!post) return response.status(404).json({ message: "게시글을 찾을 수 없습니다." });
+      if (post.authorId !== request.user.id) return response.status(403).json({ message: "본인이 작성한 게시글만 삭제할 수 있습니다." });
+      await store.removeCommunityPost(post.id);
+      return response.status(204).end();
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.post("/api/manager/community/:id/comments", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const organizationIds = managerOrganizationIds(request.user, store.organizations);
+      const post = store.communityPosts.find((item) => item.id === request.params.id && organizationIds.includes(item.organizationId));
+      if (!post) return response.status(404).json({ message: "게시글을 찾을 수 없습니다." });
+      const content = typeof request.body.content === "string" ? request.body.content.trim() : "";
+      if (!content) return response.status(400).json({ message: "댓글 내용을 입력해주세요." });
+      const now = new Date().toISOString();
+      const comment = await store.addCommunityComment({ id: randomUUID(), postId: post.id, authorId: request.user.id, content, createdAt: now, updatedAt: now });
+      return response.status(201).json(publicCommunityComment(comment));
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.delete("/api/manager/community/:postId/comments/:commentId", authenticate, requireManager, async (request, response, next) => {
+    try {
+      const comment = store.communityComments.find((item) => item.id === request.params.commentId && item.postId === request.params.postId);
+      if (!comment) return response.status(404).json({ message: "댓글을 찾을 수 없습니다." });
+      if (comment.authorId !== request.user.id) return response.status(403).json({ message: "본인이 작성한 댓글만 삭제할 수 있습니다." });
+      await store.removeCommunityComment(comment.id);
+      return response.status(204).end();
+    } catch (error) {
+      return next(error);
+    }
   });
   app.post("/api/manager/exams", authenticate, requireManager, async (request, response, next) => {
     try {
@@ -960,7 +1606,7 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
       const normalizedAnswer = answer.trim();
       if (normalizedOptions.length < 2) return response.status(400).json({ message: "선택지는 2개 이상 입력해주세요." });
       if (!normalizedOptions.includes(normalizedAnswer)) return response.status(400).json({ message: "정답은 보기 중 하나여야 합니다." });
-      const question = { id: randomUUID(), examId: request.params.id, prompt: prompt.trim(), options: normalizedOptions, answer: normalizedAnswer, createdAt: new Date().toISOString() };
+      const question = { id: randomUUID(), examId: request.params.id, type: "MULTIPLE_CHOICE", prompt: prompt.trim(), options: normalizedOptions, answer: normalizedAnswer, createdAt: new Date().toISOString() };
       await store.addQuestion(question);
       return response.status(201).json(question);
     } catch (error) {
@@ -972,7 +1618,16 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
       if (!scopedExam(request, request.params.examId)) return response.status(403).json({ message: "배정된 승인 조직의 시험만 관리할 수 있습니다." });
       const current = store.questions.find((question) => question.id === request.params.questionId && question.examId === request.params.examId);
       if (!current) return response.status(404).json({ message: "문제를 찾을 수 없습니다." });
-      if (current.type !== "CODING" || request.body.type !== "CODING") return response.status(400).json({ message: "코딩 문제만 이 화면에서 수정할 수 있습니다." });
+      if (current.type !== "CODING" && request.body.type === "CODING") return response.status(400).json({ message: "문제 유형은 변경할 수 없습니다." });
+      if (current.type === "CODING" && request.body.type !== "CODING") return response.status(400).json({ message: "문제 유형은 변경할 수 없습니다." });
+      if (current.type !== "CODING") {
+        const { prompt, options, answer } = request.body;
+        const normalizedOptions = Array.isArray(options) ? [...new Set(options.map((option) => String(option).trim()).filter(Boolean))] : [];
+        const normalizedAnswer = typeof answer === "string" ? answer.trim() : "";
+        if (!isNonEmptyText(prompt) || normalizedOptions.length < 2 || !normalizedOptions.includes(normalizedAnswer)) return response.status(400).json({ message: "문제, 두 개 이상의 선택지, 선택지에 포함된 정답을 입력해주세요." });
+        const question = await store.updateQuestion(current.id, { type: "MULTIPLE_CHOICE", prompt: prompt.trim(), options: normalizedOptions, answer: normalizedAnswer, updatedAt: new Date().toISOString() });
+        return response.json(question);
+      }
       const { title, languages, description, inputFormat, outputFormat, constraints, publicExamples, hiddenTestCases, judgeMode, numericTolerance, customJudgeCode, referenceSolutions } = request.body;
       const normalizedLanguages = Array.isArray(languages) ? [...new Set(languages.filter((language) => codingLanguages.has(language)))] : [];
       const normalizedPublicExamples = normalizeTestCases(publicExamples, true);
@@ -988,6 +1643,18 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
         referenceSolutions: normalizedReferenceSolutions, updatedAt: new Date().toISOString()
       });
       return response.json(question);
+    } catch (error) {
+      return next(error);
+    }
+  });
+  app.delete("/api/manager/exams/:examId/questions/:questionId", authenticate, requireManager, async (request, response, next) => {
+    try {
+      if (!scopedExam(request, request.params.examId)) return response.status(403).json({ message: "배정된 승인 조직의 시험만 관리할 수 있습니다." });
+      const question = store.questions.find((item) => item.id === request.params.questionId && item.examId === request.params.examId);
+      if (!question) return response.status(404).json({ message: "문제를 찾을 수 없습니다." });
+      if (store.invitations.some((invitation) => invitation.examId === request.params.examId)) return response.status(409).json({ message: "초대 발송 이력이 있는 시험의 문제는 삭제할 수 없습니다." });
+      await store.removeQuestion(question.id);
+      return response.status(204).end();
     } catch (error) {
       return next(error);
     }
@@ -1156,7 +1823,16 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
     const examinee = store.examinees.find((item) => item.id === request.params.id && organizationIds.includes(item.organizationId));
     if (!examinee || typeof request.body.offer?.sdp !== "string") return response.status(400).json({ message: "라이브 연결 대상을 확인해주세요." });
     const id = randomUUID();
-    liveSessions.set(id, { id, examId: examinee.examId, candidateId: examinee.candidateId, offer: request.body.offer, createdAt: Date.now() });
+    liveSessions.set(id, { id, source: "candidate", examId: examinee.examId, candidateId: examinee.candidateId, offer: request.body.offer, createdAt: Date.now() });
+    return response.status(201).json({ id });
+  });
+  app.post("/api/supervisor/examinees/:id/auxiliary-live-offers", authenticate, requireManager, (request, response) => {
+    const organizationIds = managerOrganizationIds(request.user, store.organizations);
+    const examinee = store.examinees.find((item) => item.id === request.params.id && organizationIds.includes(item.organizationId));
+    const device = examinee && [...auxiliaryDevices.values()].find((item) => item.examId === examinee.examId && item.candidateId === examinee.candidateId && item.deviceToken && item.expiresAt > Date.now());
+    if (!examinee || !device || typeof request.body.offer?.sdp !== "string") return response.status(400).json({ message: "연결된 보조 카메라를 확인해주세요." });
+    const id = randomUUID();
+    liveSessions.set(id, { id, source: "auxiliary", examId: examinee.examId, candidateId: examinee.candidateId, offer: request.body.offer, createdAt: Date.now() });
     return response.status(201).json({ id });
   });
   app.get("/api/supervisor/live-offers/:id", authenticate, requireManager, (request, response) => {
@@ -1245,7 +1921,9 @@ export const createApp = async ({ databasePath = resolve("data/database.json"), 
 
   app.use((error, _request, response, _next) => {
     console.error(error);
-    response.status(error instanceof SyntaxError && error.status === 400 ? 400 : 500).json({ message: error instanceof SyntaxError && error.status === 400 ? "요청 형식이 올바르지 않습니다." : "서버 오류가 발생했습니다." });
+    const statusCode = error instanceof SyntaxError && error.status === 400 ? 400 : Number.isInteger(error?.status) && error.status >= 400 && error.status <= 599 ? error.status : 500;
+    const message = statusCode === 500 ? "서버 오류가 발생했습니다." : typeof error?.message === "string" ? error.message : "요청을 처리하지 못했습니다.";
+    response.status(statusCode).json({ message });
   });
   return app;
 };

@@ -6,8 +6,9 @@ const AdminGovernanceTab = lazy(() => import('../admin/AdminGovernanceTab'));
 const UserMgmtTab = lazy(() => import('../admin/UserMgmtTab'));
 const AiConfigTab = lazy(() => import('../admin/AiConfigTab'));
 const InvitationSettingsTab = lazy(() => import('../admin/InvitationSettingsTab'));
+const NoticeManagementTab = lazy(() => import('../admin/NoticeManagementTab'));
+const CommunityTab = lazy(() => import('../manager/CommunityTab'));
 const ManagerWorkspaceTab = lazy(() => import('../manager/ManagerWorkspaceTab'));
-const ManagerExamManagementTab = lazy(() => import('../manager/ManagerExamManagementTab'));
 
 // 🌟 응시자 전용 탭 컴포넌트 임포트
 const HomeTab = lazy(() => import('../applicant/HomeTab'));
@@ -17,13 +18,13 @@ const PracticeTab = lazy(() => import('../applicant/PracticeTab'));
 const NoticeTab = lazy(() => import('../applicant/NoticeTab'));
 const FaqTab = lazy(() => import('../applicant/FaqTab'));
 
-// 🌟 감독관 전용 탭 컴포넌트 임포트
+// 🌟 매니저 전용 탭 컴포넌트 임포트
 const LiveMonitoringTab = lazy(() => import('../supervisor/LiveMonitoringTab'));
 const CheatLogsTab = lazy(() => import('../supervisor/CheatLogsTab'));
 const ExamStatusTab = lazy(() => import('../supervisor/ExamStatusTab'));
 const SupervisorReportsTab = lazy(() => import('../supervisor/ReportsTab'));
 const ExamPolicyTab = lazy(() => import('../supervisor/ExamPolicyTab'));
-const SupervisorExamDirectoryTab = lazy(() => import('../supervisor/SupervisorExamDirectoryTab'));
+const SupervisorExamDashboard = lazy(() => import('../supervisor/SupervisorExamDashboard'));
 
 export default function HomePage() {
   const navigate = useNavigate();
@@ -61,7 +62,7 @@ export default function HomePage() {
         <Suspense fallback={<div className="workspace-loading">화면을 불러오는 중입니다...</div>}>
 
         {/* =========================================================================
-            🛡️ [관리자(ADMIN) 전용 탭 라우팅 허브]
+            🛡️ [관리자 전용 탭 라우팅 허브]
             ========================================================================= */}
         {isAdmin && !showHome && (
           <div>
@@ -69,16 +70,20 @@ export default function HomePage() {
             {activeTab === 'USER_MGMT' && <UserMgmtTab />} 
             {activeTab === 'AI_CONFIG' && <AiConfigTab />}
             {activeTab === 'INVITATION_SETTINGS' && <InvitationSettingsTab />}
+            {activeTab === 'NOTICE_MANAGEMENT' && <NoticeManagementTab />}
+            {activeTab === 'COMMUNITY' && <CommunityTab />}
           </div>
         )}
 
         {/* =========================================================================
-            👁️ [감독관(SUPERVISOR) 전용 탭 라우팅 허브] 🌟 새로 추가됨
+            👁️ [매니저 전용 탭 라우팅 허브] 🌟 새로 추가됨
             ========================================================================= */}
         {isSupervisor && !showHome && (
           <div>
             {activeTab === 'MANAGER_WORKSPACE' && <ManagerWorkspaceTab />} 
-            {activeTab === 'EXAMS' && <SupervisorExamDirectoryTab />}
+            {activeTab === 'EXAMS' && <SupervisorExamDashboard />}
+            {activeTab === 'NOTICE_MANAGEMENT' && <NoticeManagementTab />}
+            {activeTab === 'COMMUNITY' && <CommunityTab />}
             {activeTab === 'LIVE_MONITORING' && <LiveMonitoringTab />}
             {activeTab === 'CHEAT_LOGS' && <CheatLogsTab />}
             {activeTab === 'EXAM_STATUS' && <ExamStatusTab />}

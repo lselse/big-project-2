@@ -23,6 +23,56 @@ const signupManager = async (baseUrl, email, name = "신규 조직 관리자") =
   return fetch(`${baseUrl}/api/auth/signup`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, email, password: "safe-password", verificationToken: confirmPayload.verificationToken }) });
 };
 
+test("allows browser preflight for applicant media status PUT requests", async (context) => {
+  const { baseUrl, server } = await startServer();
+  context.after(() => server.close());
+
+  const preflight = await fetch(`${baseUrl}/api/applicant/media-status`, {
+    method: "OPTIONS",
+    headers: {
+      Origin: "http://localhost:5173",
+      "Access-Control-Request-Method": "PUT",
+      "Access-Control-Request-Headers": "authorization,content-type"
+    }
+  });
+
+  assert.equal(preflight.status, 204);
+  assert.match(preflight.headers.get("access-control-allow-methods") ?? "", /(?:^|,)PUT(?:,|$)/);
+});
+
+test("updates objective questions and blocks question deletion after an invitation is sent", async (context) => {
+  const { baseUrl, server } = await startServer();
+  context.after(() => server.close());
+  const login = await fetch(`${baseUrl}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "supervisor@aivle.com", password: "123", role: "MANAGER" }) });
+  const manager = await login.json();
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${manager.token}` };
+  const organizations = await fetch(`${baseUrl}/api/manager/organizations`, { headers });
+  const organization = (await organizations.json()).find((item) => item.status === "APPROVED" && item.canManage);
+  const examResponse = await fetch(`${baseUrl}/api/manager/exams`, { method: "POST", headers, body: JSON.stringify({ organizationId: organization.id, title: "문제 CRUD 시험", duration: "30분", questions: "2문제" }) });
+  const exam = await examResponse.json();
+  const createQuestion = async (prompt) => fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions`, { method: "POST", headers, body: JSON.stringify({ type: "MULTIPLE_CHOICE", prompt, options: ["1", "2"], answer: "2" }) });
+  const questionResponse = await createQuestion("수정 전 문제");
+  assert.equal(questionResponse.status, 201);
+  const question = await questionResponse.json();
+  const update = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions/${question.id}`, { method: "PATCH", headers, body: JSON.stringify({ type: "MULTIPLE_CHOICE", prompt: "수정 후 문제", options: ["A", "B", "C"], answer: "B" }) });
+  assert.equal(update.status, 200);
+  assert.equal((await update.json()).prompt, "수정 후 문제");
+  const deletion = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions/${question.id}`, { method: "DELETE", headers });
+  assert.equal(deletion.status, 204);
+  const missing = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions/${question.id}`, { method: "DELETE", headers });
+  assert.equal(missing.status, 404);
+
+  const protectedQuestion = await createQuestion("초대 후 보호되는 문제");
+  const protectedQuestionData = await protectedQuestion.json();
+  const candidateResponse = await fetch(`${baseUrl}/api/manager/candidates`, { method: "POST", headers, body: JSON.stringify({ organizationId: organization.id, name: "초대 대상", email: "question-delete@example.com", birthDate: "2000-01-01" }) });
+  const candidate = await candidateResponse.json();
+  await fetch(`${baseUrl}/api/manager/exams/${exam.id}/assign`, { method: "POST", headers, body: JSON.stringify({ candidateIds: [candidate.id] }) });
+  const invitation = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/invitations/send`, { method: "POST", headers, body: JSON.stringify({ candidateIds: [candidate.id] }) });
+  assert.equal(invitation.status, 201);
+  const blocked = await fetch(`${baseUrl}/api/manager/exams/${exam.id}/questions/${protectedQuestionData.id}`, { method: "DELETE", headers });
+  assert.equal(blocked.status, 409);
+});
+
 test("serves public data and protects administration endpoints", async (context) => {
   const { baseUrl, directory, server } = await startServer();
   context.after(() => server.close());
@@ -64,6 +114,154 @@ test("serves public data and protects administration endpoints", async (context)
   const assignedSeedExaminees = await fetch(`${baseUrl}/api/supervisor/examinees?examId=exam-2026-second-half`, { headers: { Authorization: `Bearer ${manager.token}` } });
   assert.equal(assignedSeedExaminees.status, 200);
   assert.equal((await assignedSeedExaminees.json()).some((item) => item.candidateId === "candidate-1"), true);
+});
+
+test("allows ADMIN to manage searchable and scheduled public notices", async (context) => {
+  const { baseUrl, server } = await startServer();
+  context.after(() => server.close());
+
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "admin@aivle.com", password: "123" })
+  });
+  const { token } = await login.json();
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${token}` };
+
+  const denied = await fetch(`${baseUrl}/api/admin/notices`);
+  assert.equal(denied.status, 401);
+
+  const created = await fetch(`${baseUrl}/api/admin/notices`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ title: "긴급 점검 안내", content: "오늘 18시에 점검합니다.", category: "URGENT", pinned: true })
+  });
+  assert.equal(created.status, 201);
+  const notice = await created.json();
+  assert.equal(notice.pinned, true);
+
+  const search = await fetch(`${baseUrl}/api/notices?q=18시&category=URGENT`);
+  assert.equal(search.status, 200);
+  assert.equal((await search.json()).some((item) => item.id === notice.id), true);
+
+  const detail = await fetch(`${baseUrl}/api/notices/${notice.id}`);
+  assert.equal((await detail.json()).viewCount, 1);
+
+  const updated = await fetch(`${baseUrl}/api/admin/notices/${notice.id}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify({ title: "긴급 점검 시간 변경", content: "오늘 19시에 점검합니다.", category: "MAINTENANCE" })
+  });
+  assert.equal(updated.status, 200);
+  assert.equal((await updated.json()).title, "긴급 점검 시간 변경");
+
+  const removed = await fetch(`${baseUrl}/api/admin/notices/${notice.id}`, { method: "DELETE", headers });
+  assert.equal(removed.status, 204);
+  assert.equal((await fetch(`${baseUrl}/api/notices/${notice.id}`)).status, 404);
+});
+
+test("scopes manager notices to assigned organizations and exams", async (context) => {
+  const { baseUrl, server } = await startServer();
+  context.after(() => server.close());
+
+  const login = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "supervisor@aivle.com", password: "123", role: "MANAGER" })
+  });
+  const { token } = await login.json();
+  const headers = { "Content-Type": "application/json", Authorization: `Bearer ${token}` };
+
+  const created = await fetch(`${baseUrl}/api/manager/notices`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      title: "조직 응시 안내",
+      content: "시험 시작 전에 장비 점검을 완료해주세요.",
+      category: "EXAM",
+      scope: "EXAM",
+      organizationId: "org-aivle-cs",
+      examId: "exam-2026-second-half"
+    })
+  });
+  assert.equal(created.status, 201);
+  const notice = await created.json();
+  assert.equal(notice.scope, "EXAM");
+  assert.equal(notice.organizationId, "org-aivle-cs");
+
+  const publicNotices = await fetch(`${baseUrl}/api/notices`);
+  assert.equal((await publicNotices.json()).some((item) => item.id === notice.id), false);
+
+  const denied = await fetch(`${baseUrl}/api/manager/notices`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      title: "다른 조직 공지",
+      content: "등록되면 안 됩니다.",
+      scope: "ORGANIZATION",
+      organizationId: "org-data-lab"
+    })
+  });
+  assert.equal(denied.status, 403);
+
+  const managed = await fetch(`${baseUrl}/api/manager/notices`, { headers });
+  assert.equal((await managed.json()).some((item) => item.id === notice.id), true);
+});
+
+test("scopes community posts and comments to a manager organization", async (context) => {
+  const { baseUrl, server } = await startServer();
+  context.after(() => server.close());
+
+  const managerLogin = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "supervisor@aivle.com", password: "123", role: "MANAGER" })
+  });
+  const manager = await managerLogin.json();
+  const managerHeaders = { "Content-Type": "application/json", Authorization: `Bearer ${manager.token}` };
+
+  const created = await fetch(`${baseUrl}/api/manager/community`, {
+    method: "POST",
+    headers: managerHeaders,
+    body: JSON.stringify({
+      title: "시험 환경 질문",
+      content: "화면 공유는 언제 시작하나요?",
+      category: "QUESTION",
+      organizationId: "org-aivle-cs",
+      examId: "exam-2026-second-half"
+    })
+  });
+  assert.equal(created.status, 201);
+  const post = await created.json();
+  assert.equal(post.organizationId, "org-aivle-cs");
+
+  const comment = await fetch(`${baseUrl}/api/manager/community/${post.id}/comments`, {
+    method: "POST",
+    headers: managerHeaders,
+    body: JSON.stringify({ content: "사전 환경 점검 단계에서 시작합니다." })
+  });
+  assert.equal(comment.status, 201);
+
+  const detail = await fetch(`${baseUrl}/api/manager/community/${post.id}`, { headers: managerHeaders });
+  const detailPayload = await detail.json();
+  assert.equal(detailPayload.comments.length, 1);
+  assert.equal(detailPayload.commentCount, 1);
+
+  const denied = await fetch(`${baseUrl}/api/manager/community`, {
+    method: "POST",
+    headers: managerHeaders,
+    body: JSON.stringify({ title: "다른 조직 글", content: "등록 불가", organizationId: "org-data-lab" })
+  });
+  assert.equal(denied.status, 403);
+
+  const adminLogin = await fetch(`${baseUrl}/api/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: "admin@aivle.com", password: "123" })
+  });
+  const admin = await adminLogin.json();
+  const adminList = await fetch(`${baseUrl}/api/admin/community`, { headers: { Authorization: `Bearer ${admin.token}` } });
+  assert.equal((await adminList.json()).some((item) => item.id === post.id), true);
 });
 
 test("registers managers for ADMIN approval before login", async (context) => {
