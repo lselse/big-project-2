@@ -1285,16 +1285,16 @@ main {
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%); /* 정확히 화면 중앙에 위치 */
-  
+
   width: min(85%, 28rem);
   aspect-ratio: 85.6 / 54; /* 세로 높이 대신 비율 사용 */
-  
+
   border: 3px solid #ffffff;
   border-radius: 12px;
   box-shadow:
     0 0 0 9999px rgba(15, 23, 42, 0.35),
     0 0 15px rgba(0, 0, 0, 0.25);
-  
+
   z-index: 10; /* 비디오 태그보다 위에 올라오도록 지정 */
 }
 
